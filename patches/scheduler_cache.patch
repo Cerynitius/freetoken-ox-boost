@@ -1,0 +1,43 @@
+--- a/python/freetoken/scheduler/cache.py
++++ b/python/freetoken/scheduler/cache.py
+@@ -60,6 +60,12 @@
+         self.num_pages = num_pages
+         self.page_table = page_table
+         self.page_size = page_size
++        # MTP speculative decoding lookahead (glm5): allocate_paged keeps +k pages of
++        # horizon per request so the engine's verify forward can write KV at positions
++        # device_len..device_len+k-1 without any scheduler round-trip.
++        import os as _os
++
++        self.spec_horizon = int(_os.environ.get("FREETOKEN_GLM5_SPEC", "0") or 0)
+         self.cache_type = type
+ 
+     # ----- capability hooks (defaults; plugged-in pools may narrow them) -----
+@@ -256,9 +262,18 @@
+     def allocate_paged(self, reqs: List[Req]) -> None:
+         needed_pages = 0
+         allocation_info: List[Tuple[int, int, int]] = []
++        width = self.page_table.shape[1]
++        # Horizon only while the pool is comfortable; the spec gate in the engine checks
++        # req.spec_alloc_len before verifying, so a skipped horizon just means no spec.
++        horizon = self.spec_horizon if len(self.free_slots) > 1024 else 0
+         for req in reqs:
+             first_page = div_ceil(req.cached_len, self.page_size)
+             last_page = div_ceil(req.device_len, self.page_size)
++            if horizon:
++                first_page = max(first_page, req.spec_alloc_len // self.page_size)
++                tgt = min(req.device_len + horizon, width)
++                last_page = max(last_page, div_ceil(tgt, self.page_size))
++                req.spec_alloc_len = max(req.spec_alloc_len, last_page * self.page_size)
+             if last_page > first_page:
+                 needed_pages += last_page - first_page
+                 allocation_info.append((req.table_idx, first_page, last_page))
+@@ -516,6 +531,8 @@
+         to the finishing request. ``start`` is page-aligned (a match/insert boundary), so the
+         full-pool page bases derived via ``[::page_size]`` are identical to the unpadded slice."""
+         end = div_ceil(req.cached_len, self.page_size) * self.page_size
++        # Spec horizon pages (beyond cached_len) belong to this request too.
++        end = max(end, getattr(req, "spec_alloc_len", 0))
+         return self.page_table[req.table_idx, start:end]
+ 
+     def _free_req_slots(self, req: Req, keep_live: bool = False) -> None:

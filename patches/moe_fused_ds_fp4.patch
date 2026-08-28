@@ -1,0 +1,40 @@
+--- a/python/freetoken/moe/fused_ds_fp4.py
++++ b/python/freetoken/moe/fused_ds_fp4.py
+@@ -9,6 +9,8 @@
+ 
+ from __future__ import annotations
+ 
++import os
++
+ import torch
+ import triton
+ 
+@@ -210,10 +212,24 @@
+     # One static config for every density (no autotune): the kernel is
+     # dequant-floor-bound, so per-expert padding at BLOCK_M=64 costs the same
+     # as tighter tiles while keeping the wgmma-wide M tile on sm_90.
+-    cfg = dict(
+-        BLOCK_SIZE_M=64, BLOCK_SIZE_N=64, BLOCK_SIZE_K=64, GROUP_SIZE_M=8,
+-        num_warps=8, num_stages=1,
+-    )
++    #
++    # LOCAL PATCH (sm_120+): the 64/64/64 + 8-warp shape above is justified in its own
++    # comment by "the wgmma-wide M tile on sm_90". Blackwell sm_120 has NO wgmma, so that
++    # justification does not apply here; wider N/K tiles at half the warps were measured
++    # 1.44x faster on both grouped GEMMs at DSV4 shapes with bit-identical output.
++    # BLOCK_SIZE_M stays 64 so moe_align_block_size is untouched.
++    # Revert without editing code:  FREETOKEN_DSFP4_TILE=legacy
++    if (os.environ.get("FREETOKEN_DSFP4_TILE", "").strip().lower() != "legacy"
++            and torch.cuda.get_device_capability(x.device)[0] >= 12):
++        cfg = dict(
++            BLOCK_SIZE_M=64, BLOCK_SIZE_N=128, BLOCK_SIZE_K=128, GROUP_SIZE_M=8,
++            num_warps=4, num_stages=1,
++        )
++    else:
++        cfg = dict(
++            BLOCK_SIZE_M=64, BLOCK_SIZE_N=64, BLOCK_SIZE_K=64, GROUP_SIZE_M=8,
++            num_warps=8, num_stages=1,
++        )
+     sorted_ids, expert_ids, ntpp = moe_align_block_size(slots, cfg["BLOCK_SIZE_M"], num_rows)
+     tw = topk_weights.reshape(-1).contiguous()
+ 

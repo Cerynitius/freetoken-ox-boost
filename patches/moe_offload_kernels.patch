@@ -1,0 +1,29 @@
+--- a/python/freetoken/moe/offload_kernels.py
++++ b/python/freetoken/moe/offload_kernels.py
+@@ -25,6 +25,26 @@
+     tensor. ``out_indices`` aliases the input, preserving the in-place rewrite every
+     downstream GEMM depends on.
+     """
++    if cache.cache_policy == "lfu":
++        # Frequency-aware admission for flat routing (GLM-5.3): one-touch experts are
++        # evicted before repeat visitors. See freetoken/moe/lfu_ensure.py.
++        from freetoken.moe.lfu_ensure import lfu_ensure
++
++        lfu_ensure(
++            expert_ids,
++            cache.slot_for_id.view(-1),
++            cache.id_of_slot,
++            cache.usage,
++            cache.step,
++            cache.lru_freq,
++            expert_ids,
++            cache.src_indices,
++            cache.evict_slots,
++            cache.num_indices,
++            stats=cache.lru_stats[layer_id] if cache.collect_stats else None,
++            id_base=layer_id * cache.num_experts,
++        )
++        return
+     lru_ensure(
+         expert_ids,
+         cache.slot_for_id.view(-1),

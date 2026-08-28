@@ -1,0 +1,14 @@
+--- a/python/freetoken/core.py
++++ b/python/freetoken/core.py
+@@ -64,6 +64,11 @@
+     # handler must not free resources under an in-flight forward; it sets this flag and
+     # _process_last_data frees the request when the batch drains (after copy_done.synchronize).
+     aborted: bool = False
++    # Speculative-decoding allocation watermark (tokens, page-aligned): pages for positions
++    # < spec_alloc_len are ALREADY allocated (the +k lookahead horizon). allocate_paged must
++    # never re-allocate below it -- a double-alloc would re-point pages whose KV the verify
++    # forward already wrote. 0 for non-spec models.
++    spec_alloc_len: int = 0
+ 
+     def __post_init__(self) -> None:
+         assert self.input_ids.is_cpu

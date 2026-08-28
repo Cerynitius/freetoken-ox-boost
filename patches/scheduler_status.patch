@@ -1,0 +1,33 @@
+--- a/python/freetoken/scheduler/status.py
++++ b/python/freetoken/scheduler/status.py
+@@ -112,8 +112,30 @@
+         self._last_decode_time = now
+         gen_throughput = self._decode_generated_tokens / gap if gap > 0 else 0.0
+         self._decode_generated_tokens = 0
++        moe = ""
++        try:  # armed only under --moe-collect-stats; never let stats break serving
++            from freetoken.core import get_global_ctx
++
++            cache = getattr(get_global_ctx(), "moe_offload_cache", None)
++            if cache is not None and getattr(cache, "collect_stats", False):
++                ms = cache.decode_miss_stats()
++                moe = f"moe-miss: {ms['miss_rate']:.3f}, "
++            if cache is not None and getattr(cache, "collect_decode_freq", False):
++                rs = cache.decode_routing_stats()
++                if rs:
++                    moe += (
++                        f"oracle@{rs['slots_per_layer']:.0f}: {rs['oracle_hit_at_slots']:.3f}, "
++                        f"ws90: {rs['experts_for_90pct']:.0f}, Hn: {rs['norm_entropy']:.3f}, "
++                    )
++                if self._decode_forward_count % (self.decode_log_interval * 20) == 0:
++                    pl = cache.decode_miss_stats_per_layer()["per_layer"]
++                    rates = " ".join(f"{d['miss_rate']:.2f}" for d in pl)
++                    self.log(f"moe per-layer miss: {rates}")
++        except Exception:
++            pass
+         self.log(
+             f"Decode batch, "
++            f"{moe}"
+             f"#running-req: {running_reqs}, "
+             f"#token: {kv_used_pages * page_size}, "
+             f"token usage: {_usage_ratio(kv_used_pages, kv_total_pages):.2f}, "

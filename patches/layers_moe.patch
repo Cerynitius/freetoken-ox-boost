@@ -1,0 +1,192 @@
+--- a/python/freetoken/layers/moe.py
++++ b/python/freetoken/layers/moe.py
+@@ -192,8 +192,25 @@
+             apply_router_weight_on_input=self.apply_router_weight_on_input,
+         )
+         return self._maybe_all_reduce(final_hidden_states)
++
++
++# Routing-trace measurement hook (eager only): path to dump (layer, phase, ids).
++_ROUTE_TRACE = os.environ.get("FREETOKEN_ROUTE_TRACE", "")
++_ROUTE_TRACE_BUF: list = []
++_ROUTE_TRACE_SHARD: int = 0
++
++# Fallback-free miss cap: fetch at most N missing experts per layer-step at decode,
++# DROP the overflow (weight-renormalized). -1 = off (fetch everything, exact).
++_MISS_CAP = int(os.environ.get("FREETOKEN_MOE_MISS_CAP", "-1") or -1)
+ 
++# Speculative expert prefetch count per token (0 = off); see moe/spec_prefetch.py.
++_SPEC_BLOCK_OF: dict = {}  # id(OffloadMoELayer) -> its sparse block (cycle-free)
++_SPEC_PREFETCH = int(os.environ.get("FREETOKEN_MOE_SPEC_PREFETCH", "0") or 0)
+ 
++# Short-prefill on-demand fetch threshold (tokens); 0 disables (always stream).
++_PREFILL_ONDEMAND_TOKENS = int(os.environ.get("FREETOKEN_PREFILL_ONDEMAND_TOKENS", "48") or 0)
++
++
+ class OffloadMoELayer(MoELayer):
+     def __init__(
+         self,
+@@ -245,6 +262,21 @@
+         rewrites expert ids into cache slot ids); pass a fresh tensor or a clone.
+         """
+         ctx = get_global_ctx()
++        if _ROUTE_TRACE:
++            # Raw expert ids BEFORE the in-place slot rewrite. Eager-only measurement
++            # hook (graphs replay past python); dump every 2000 records.
++            rec = _ROUTE_TRACE_BUF
++            rec.append((self.layer_id,
++                        "P" if ctx.batch.is_prefill else "D",
++                        topk_ids.detach().cpu().clone(),
++                        hidden_states.detach().to(torch.float16).cpu().clone()))
++            if len(rec) >= 4000:  # shard to disk and clear (avoid GB-scale rewrites)
++                import torch as _t
++
++                global _ROUTE_TRACE_SHARD
++                _t.save(rec, f"{_ROUTE_TRACE}.shard{_ROUTE_TRACE_SHARD}")
++                _ROUTE_TRACE_SHARD += 1
++                rec.clear()
+         if ctx.batch.is_prefill:
+             out = self._prefill_routed(hidden_states, topk_weights, topk_ids)
+         else:
+@@ -309,9 +341,43 @@
+             return executor.decode(self.layer_id, hidden_states, topk_weights, topk_ids)
+         if cache.decode_target == "hybrid":
+             return self._decode_hybrid(cache, hidden_states, topk_weights, topk_ids)
++        pf = self._spec_pf(cache)
++        if _MISS_CAP >= 0:
++            # AdapMoE/CommitMoE-style fallback-free decode: fetch at most _MISS_CAP
++            # missing experts per layer-step; the overflow misses are DROPPED (ids -1
++            # from the hybrid ensure) with their routing weight redistributed over the
++            # surviving experts (mass-preserving renormalization). Quality-affecting:
++            # gate with MMLU before any promotion.
++            from freetoken.moe.offload_kernels import ensure_experts_hybrid
++
++            cache._pending_src_layer = self.layer_id  # staged for copy_missing
++            cache._pending_whole_layer = False
++            ensure_experts_hybrid(cache, self.layer_id, topk_ids, _MISS_CAP, 0.0)
++            cache.copy_missing()
++            if pf is not None:
++                pf.before_gemm(self.layer_id)
++            on_gpu = topk_ids >= 0
++            w_kept = torch.where(on_gpu, topk_weights, topk_weights.new_zeros(()))
++            mass = topk_weights.sum(dim=-1, keepdim=True)
++            w = w_kept * (mass / w_kept.sum(dim=-1, keepdim=True).clamp_min(1e-9))
++            out = self._expert_gemm(
++                cache,
++                hidden_states,
++                w.contiguous(),
++                topk_ids.clamp_min(0),
++                views=cache.bank_views(),
++                n=None,
++                alphas=cache.alphas_for_slots(self.layer_id),
++                is_prefill=False,
++            )
++            if pf is not None:
++                pf.launch(self.layer_id, hidden_states)
++            return out
+         cache.ensure_experts(self.layer_id, topk_ids)
+         cache.copy_missing()
+-        return self._expert_gemm(
++        if pf is not None:
++            pf.before_gemm(self.layer_id)  # prefetched data for THIS layer must have landed
++        out = self._expert_gemm(
+             cache,
+             hidden_states,
+             topk_weights,
+@@ -321,7 +387,29 @@
+             alphas=cache.alphas_for_slots(self.layer_id),
+             is_prefill=False,
+         )
++        if pf is not None:
++            pf.launch(self.layer_id, hidden_states)
++        return out
++
++    def spec_set_block(self, block) -> None:
++        # Module-level registry, NOT an attribute: block.experts -> layer ->
++        # block would form a cycle and blow up the module-walking iterators.
++        _SPEC_BLOCK_OF[id(self)] = block
+ 
++    def _spec_pf(self, cache):
++        """Lazily build the shared SpecPrefetch and register this layer's block."""
++        if not _SPEC_PREFETCH:
++            return None
++        pf = getattr(cache, "spec_pf", None)
++        if pf is None:
++            from freetoken.moe.spec_prefetch import SpecPrefetch
++
++            pf = cache.spec_pf = SpecPrefetch(cache, _SPEC_PREFETCH)
++        blk = _SPEC_BLOCK_OF.get(id(self))
++        if blk is not None:
++            pf.blocks.setdefault(self.layer_id, blk)
++        return pf
++
+     def _decode_hybrid(
+         self,
+         cache: OffloadMoeCache,
+@@ -380,9 +468,65 @@
+         """Prefill movement: stream whole layers -- double-buffered behind the
+         previous layer's GEMMs when ``prefill_overlap`` is on, else a synchronous
+         ``materialize_layer``. In both, position == expert id, so the routing ids
+-        pass through unmapped."""
++        pass through unmapped.
++
++        Short batches instead fetch on demand: <= _PREFILL_ONDEMAND_TOKENS tokens
++        activate far fewer than 288 experts, so the decode-style LRU fetch beats
++        streaming the whole 3.3GB bank (which makes TTFT flat ~2.1s regardless of
++        prompt length). Also pre-warms the LRU with this request's experts for the
++        decode that follows. The overlap double-buffer machinery is never armed on
++        this path (begin_prefill is layer-driven), so the two paths cannot mix state."""
+         cache = self.offload_cache
+         assert cache is not None
++        if (
++            0 < _PREFILL_ONDEMAND_TOKENS
++            and hidden_states.shape[0] <= _PREFILL_ONDEMAND_TOKENS
++            and not cache.is_cpu_layer(self.layer_id)
++            and self.layer_id not in cache._unpinned_layers
++            and cache.gate_up_alpha is None  # scratch path only for the triton format
++        ):
++            # Gather the activated experts into a small dense table WITHOUT touching
++            # the LRU: a short prompt activates ~100+ unique experts x 39 layers,
++            # which would churn the entire slot cache and cold-start every
++            # subsequent decode (measured: 25 -> 14 tok/s). Cache hits are read-only
++            # D2D; misses stream straight from the host banks via fast_index_copy.
++            from freetoken.kernel import fast_index_copy_jit
++
++            uniq, inv = torch.unique(topk_ids, return_inverse=True)
++            u = uniq.numel()
++            gid = (self.layer_id * cache.num_experts + uniq).long()
++            slots = cache.slot_for_id.view(-1)[gid]  # >=0 resident (pure read)
++            hit = slots >= 0
++            hpos = hit.nonzero(as_tuple=True)[0]
++            mpos = (~hit).nonzero(as_tuple=True)[0].to(torch.int32)
++            mids = uniq[mpos.long()].to(torch.int32)
++            nmiss = torch.tensor([mpos.numel()], dtype=torch.int64,
++                                 device=topk_ids.device)
++            views = []
++            for per_layer, slab in cache.banks:
++                tmp = torch.empty((u,) + slab.shape[1:], dtype=slab.dtype,
++                                  device=slab.device)
++                if hpos.numel():
++                    # torch index ops lack Float8 kernels; route through a byte view.
++                    if tmp.dtype == torch.float8_e4m3fn:
++                        tmp.view(torch.uint8).index_copy_(
++                            0, hpos, slab.view(torch.uint8).index_select(
++                                0, slots[hit].long()))
++                    else:
++                        tmp.index_copy_(0, hpos, slab.index_select(0, slots[hit].long()))
++                if mpos.numel():
++                    fast_index_copy_jit(tmp, mpos, per_layer[self.layer_id], mids, nmiss)
++                views.append(tmp)
++            return self._expert_gemm(
++                cache,
++                hidden_states,
++                topk_weights,
++                inv.to(topk_ids.dtype).view_as(topk_ids),
++                views=tuple(views),
++                n=u,
++                alphas=None,
++                is_prefill=True,
++            )
+         if cache.prefill_overlap:
+             views = self._wait_prefill_overlap(cache)
+             out = self._expert_gemm(
