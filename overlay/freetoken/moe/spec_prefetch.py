@@ -24,7 +24,11 @@ import os
 import torch
 import torch.nn.functional as F
 
+# <0 = follow the bs==1 count. Sweep 2026-08-29 (conc2/conc4 agg): P_multi 0 -> 38.1/44.5,
+# 4 -> 39.8/49.2, 8 -> 37.3/41.5 -- uniform P=4 wins at every batch size.
+_COUNT_MULTI = int(os.environ.get("FREETOKEN_MOE_SPEC_PREFETCH_MULTI", "-1") or -1)
 HOP = int(os.environ.get("FREETOKEN_MOE_SPEC_HOP", "1") or 1)
+_HOP_MULTI = int(os.environ.get("FREETOKEN_MOE_SPEC_HOP_MULTI", "1") or 1)  # hop-2 at bs>1: conc2 39.7 vs 39.8, conc4 46 vs 49 -- no win (2026-08-29)
 
 
 class SpecPrefetch:
@@ -37,11 +41,15 @@ class SpecPrefetch:
         self.stream = torch.cuda.Stream(device=dev)
         self.ev_gemm = [torch.cuda.Event() for _ in range(nb)]
         self.ev_copy = [torch.cuda.Event() for _ in range(nb)]
-        plan = max(cache.num_experts, 8 * count)
+        # Buffers must fit the LARGEST per-launch id set: max_bs (8) tokens x the
+        # larger of the bs==1 count and the multi-stream count (_COUNT_MULTI).
+        cmax = max(count, _COUNT_MULTI, 0) or count
+        cmax = max(count, cmax)
+        plan = max(cache.num_experts, 8 * cmax)
         self.pf_rows = [torch.empty(plan, dtype=torch.int32, device=dev) for _ in range(2)]
         self.pf_slots = [torch.empty(plan, dtype=torch.int32, device=dev) for _ in range(2)]
         self.pf_num = [torch.zeros(1, dtype=torch.int64, device=dev) for _ in range(2)]
-        self.ids_buf = [torch.empty(8 * count, dtype=torch.int32, device=dev) for _ in range(2)]
+        self.ids_buf = [torch.empty(8 * cmax, dtype=torch.int32, device=dev) for _ in range(2)]
         self.pending: dict = {}  # target bank -> copy event
 
     def before_gemm(self, bank_id: int) -> None:
@@ -50,7 +58,18 @@ class SpecPrefetch:
             torch.cuda.current_stream().wait_event(ev)
 
     def launch(self, bank_id: int, hidden: torch.Tensor) -> None:
-        target = bank_id + HOP
+        # bs>1: prefetch bytes scale with batch on an already-saturated link, so use
+        # the (smaller) multi-stream budget; 0 disables. Static per captured graph --
+        # each cuda-graph batch size bakes its own branch (bs==1 keeps the tuned P).
+        count = self.count if hidden.shape[0] == 1 or _COUNT_MULTI < 0 else _COUNT_MULTI
+        if count <= 0:
+            return
+        # bs>1: fetch bytes double but the single-layer hiding window does not
+        # (conc2 profile 2026-08-29: PCIe 42.5ms/step, compute lane 56% busy).
+        # hop-2 trades ~8pp coverage for a two-layer window -- the binding
+        # constraint flips at bs>=2. Static per captured graph.
+        hop = HOP if hidden.shape[0] == 1 else _HOP_MULTI
+        target = bank_id + hop
         blk = self.blocks.get(target)
         if blk is None:
             return
@@ -62,7 +81,7 @@ class SpecPrefetch:
         scores = torch.sigmoid(logits) + blk.e_score_correction_bias.float()
         if blk.n_group > 1:
             scores = blk._group_limited(scores)
-        ids = torch.topk(scores, self.count, dim=-1)[1].to(torch.int32).reshape(-1)
+        ids = torch.topk(scores, count, dim=-1)[1].to(torch.int32).reshape(-1)
         buf = self.ids_buf[b][: ids.numel()]
         buf.copy_(ids)
         lru_ensure(

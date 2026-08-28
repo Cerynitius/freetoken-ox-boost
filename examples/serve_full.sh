@@ -25,7 +25,7 @@ MODEL=/home/zrx/glm5-stack/weights/GLM-5.3-Flash-NVFP4
 PORT="${GLM5_PORT:-1920}"
 CTX=${GLM5_CTX:-262144}
 # KV pool (tokens) decoupled from the per-request cap: 4-slot 256K = pool 1M.
-KV_RESERVE=${GLM5_KV_RESERVE:-1048576}
+KV_RESERVE=${GLM5_KV_RESERVE:-524288}
 
 systemctl --user stop dsv4-freetoken.service 2>/dev/null || true
 systemctl --user stop qwen38-vllm.service 2>/dev/null || true
@@ -41,7 +41,9 @@ exec ft serve \
   --model "$MODEL" \
   --served-model-name glm5-flash \
   --host 0.0.0.0 --port "$PORT" \
-  --moe-backend offload \
+  --moe-backend ${GLM5_MOE_BACKEND:-offload} \
+  --moe-cpu-threads ${GLM5_CPU_THREADS:-0} \
+  --moe-hybrid-max-fetch ${GLM5_HYBRID_MAXFETCH:-1} \
   --expert-load serial \
   --nvfp4-backend auto \
   --moe-cache-auto \

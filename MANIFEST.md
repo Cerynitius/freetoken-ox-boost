@@ -26,6 +26,9 @@
 | KDA gate 融合(5 GEMV→2 + 7 散核→1) | +1% | `overlay: kernel/triton/kda_gate.py` + `models/glm5_next/attention.py` | `FREETOKEN_KDA_FUSED_GATE`(1) |
 | mHC 前置融合(cast/mean/rsqrt 合一 + 免原子 gemv) | 噪声内(核数 −6/层) | `overlay: kernel/triton/dsv4/hc_norm.py` + `models/glm5_next/model.py` | 无开关(数值 epsilon 级) |
 | 路由融合(sigmoid+bias+topk+renorm 8 核→1) | +3.4% | `overlay: kernel/triton/fused_route.py` + `patches: models_glm_moe_dsa_moe` | `FREETOKEN_FUSED_ROUTE`(1;n_group>1 自动回退) |
+| FP8 小批 M-tile GEMV(2≤M≤4 免入 prefill GEMM) | conc2 +13%(M=2 核 3×) | `patches: kernel_triton_fp8_pertensor_linear` | 无开关(M≤4 自动) |
+| 2 槽 256K KV 池(缓存 2079→2600 槽) | 单流 +14%,conc4 +67% | `examples/serve_full.sh` | `GLM5_KV_RESERVE`(524288) |
+| CPU swiglu_clamp 支持(hybrid 后端可跑 GLM-5.3) | 本机 VM 判负,内核保留 | `patches: kernel_csrc…cpu_moe_ext / moe_cpu_executor / layers_moe(bs 门控)` | `GLM5_MOE_BACKEND=hybrid` + `GLM5_CPU_THREADS` |
 
 ## 实验存档(默认关;判决见 README)
 
@@ -36,6 +39,8 @@
 | fallback-free miss-cap(专家丢弃) | 首测 −35%(盲序 drop),待二审 | `FREETOKEN_MOE_MISS_CAP`(-1) |
 | top-k 旋钮 | top-6 +6% 但改 A18B 规格,否决 | `FREETOKEN_GLM5_TOPK`(不设=8) |
 | 路由踪迹采集 | 分析工具 | `FREETOKEN_ROUTE_TRACE`(关) |
+| bs>1 独立预取 P/hop | 扫参判定恒 P=4/hop-1 最优 | `FREETOKEN_MOE_SPEC_PREFETCH_MULTI`(-1=跟随)/`SPEC_HOP_MULTI`(1) |
+| hybrid CPU 分担 | conc4 净贡献≈0(QEMU vCPU),判负存档 | `GLM5_MOE_BACKEND`(offload) |
 | decode 步 profiler | 分析工具 | `FREETOKEN_PROFILE_DECODE`(关) |
 
 ## 基础设施(patches 01 组,非本线优化但为当前树硬依赖)
