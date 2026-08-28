@@ -8,16 +8,6 @@ host 内存 offload,PCIe Gen5 x16),单流 decode 从 **17.8 → 30.6 tok/s(+72%)
 质量闸零损(MMLU-100:本补丁集 88 / fp8 基线 87 / bf16 89,同噪声带;
 48/48 步与 HF 参考实现逐 token 一致)。
 
-## 安装
-
-```bash
-git clone https://github.com/FlashML-org/FreeToken && cd FreeToken && git checkout v0.1.2
-cd .. && git clone <本仓库> && cd freetoken-glm5-boost
-./install.sh --check ../FreeToken   # 先 dry-run
-./install.sh ../FreeToken           # 应用 36 个补丁 + 17 个 overlay 新文件
-cd ../FreeToken && pip install -e . # 或按上游 install.sh
-```
-
 启动参考 `examples/serve_full.sh`(路径按自己机器改;4 槽 256K 上下文 + 全部优化默认开)。
 
 ## 提速账本(逐项 A/B 实测)
