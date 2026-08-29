@@ -43,6 +43,15 @@ offload), single-stream decode unless noted.
 | Content-hash prefix cache for media requests (image spans keyed by per-image pixel blake2b in the negative id range; same media prefix hits, different media diverges at span start; covered leading spans slice the scatter rows) | `patches: scheduler_cache / scheduler_prefill / scheduler_utils / scheduler_scheduler` | active with `--cache-type radix`; offline mm path keeps the old skip |
 | Image-token budget knob | `overlay: models/glm5_next/image_process.py` | `FREETOKEN_GLM5_MAX_IMAGE_TOKENS` (8000 patches) |
 
+Context-cache hardening battery (all on the production box): 6-turn agent
+conversation ~1 s TTFT per turn with image spans cached (follow-up about a
+cached image: 0.8 s); cross-conversation system-prompt reuse 4.0 -> 1.0 s;
+12K-doc immediate re-query 0.8 s; conc-2 shared prefix both 1.5 s; LRU
+eviction under 275K > 262K pool pressure evicts oldest / keeps newest with
+zero integrity failures. Known edge: an identical-prefix re-query inside the
+one-decode-step window between match and the previous request's finish-insert
+pays one cold prefill (rare, benign).
+
 Measured (production box, radix + `FREETOKEN_PREFILL_ONDEMAND_TOKENS=128`):
 same-image repeat TTFT 3.8 -> 1.0 s; image-conversation turn-2 2.8 -> 1.1 s;
 long-text shared prefix 4.1 -> 1.1 s; different image never false-hits (fresh

@@ -85,6 +85,17 @@ Vision-specific overhead is otherwise negligible: a 220-token image request
 has the same TTFT as a 220-token text prompt (tower + preprocessing < 20 ms;
 the vendored preprocessor is 14 ms/image).
 
+Context caching verified under production-shaped load: a 6-turn agent
+conversation with a growing history (image interleaved) holds ~1 s TTFT per
+turn; a 6 KB system prompt is reused across separate conversations (4.0 ->
+1.0 s); a 12K-token document follow-up hits at 0.7-0.8 s even with zero think
+time; two concurrent streams share a prefix (both 1.5 s); and under 275K
+tokens of distinct fills (past the 262K pool) the LRU eviction path evicts the
+oldest entry, keeps the newest (0.2 s hit), and passes the page-accounting
+integrity check throughout. Known edge: a re-query landing within one decode
+step of the previous identical-prefix request can miss the not-yet-inserted
+prefix and pay one cold prefill (benign, self-heals).
+
 ## Layout
 
 ```
