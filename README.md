@@ -37,64 +37,11 @@ measurement conditions.
 See `examples/serve_full.sh` for a launch reference (adjust paths and
 configuration for your machine).
 
-## Vision support (multimodal GLM-5.3-Flash)
+## Vision and video
 
-The checkpoint's full `Glm5NextVisionModel` tower (0.6B ViT: Conv3d patch
-embed, 24 attention blocks, 2x2 spatial-merge downsample, clamped-swiglu
-merger) is ported and wired end-to-end through the serving stack:
+The checkpoint's 0.6B ViT tower is ported and wired end to end. Images work on both the OpenAI and Anthropic-style endpoints, video on the OpenAI endpoint via PyAV at 2 fps by default. Enable with FREETOKEN_GLM5_VISION=1, off by default, costs about 1.2 GB VRAM, and the text-only path is byte-identical when off. Preprocessing is bitwise-equal to the HF image processor and tower drift stays within the BF16 noise between HF's own sdpa and eager backends. Verified on the production server for description, counting, two-image comparison, text-in-image, and motion on video. A 220-token image request has the same TTFT as a 220-token text prompt.
 
-- `overlay: models/glm5_next/vision.py` — faithful eager port, validated
-  stage-by-stage against the HF reference on the real weights: patch embed and
-  rotary tables bitwise-equal; residual per-layer drift is within the BF16
-  kernel-noise envelope measured between HF's own sdpa and eager backends.
-- `overlay: models/glm5_next/image_process.py` — vendored preprocessing
-  (smart resize -> bicubic -> pad -> CLIP normalize -> patchify), bitwise-equal
-  `pixel_values` vs HF `Glm5NextImageProcessorPil` on test images (the runtime
-  env pins transformers 5.15.x, which has no glm5_next classes). Needs `pillow`.
-- Intake patches (`server_* / tokenizer_* / message_* / scheduler_scheduler`) —
-  images accepted on **both APIs** (OpenAI `image_url` data URI or http URL,
-  Anthropic base64 `image` blocks), chat-template placeholder expansion in the
-  tokenize worker, pixel transport over the ZMQ msgpack codec, and vision
-  encoding at request admission inside the scheduler process (which owns the
-  GPU).
-
-Enable with `FREETOKEN_GLM5_VISION=1` (default off; the BF16 tower costs
-~1.2 GB VRAM, text-only behavior is byte-identical when off). Multi-image
-prompts work; an image prompt must fit in a single prefill chunk. Verified
-end-to-end on the production server: shape/color/position description, object
-counting, two-image comparison, and text-in-image reading through both
-endpoints.
-
-**Video input** is supported on the OpenAI endpoint (`{"type": "video_url"}`
-content parts, data URI or http URL; decoded via PyAV): frames are sampled at
-`FREETOKEN_GLM5_VIDEO_FPS` (2), paired into temporal patches, and expanded
-into per-second frame blocks with timestamps exactly like the HF processor.
-Budgets: `FREETOKEN_GLM5_MAX_VIDEO_TOKENS` (8000 patches for the whole clip),
-`FREETOKEN_GLM5_MAX_VIDEO_FRAMES` (64). Verified: motion direction,
-start/end positions, and colors on a synthetic clip.
-
-**Prefix caching works for image and video requests** (this patch set makes it
-content-safe): each image span's placeholder ids are replaced by a per-image
-pixel-content hash in the radix cache keys, so identical text+media prefixes
-hit while different images diverge at the span's first token. Measured on the
-production box: repeating the same image request drops TTFT 3.8 -> 1.0 s;
-different images never false-hit; a follow-up turn in the same image
-conversation drops 2.8 -> 1.1 s (with `--cache-type radix` and
-`FREETOKEN_PREFILL_ONDEMAND_TOKENS=128`, both now the example defaults).
-Vision-specific overhead is otherwise negligible: a 220-token image request
-has the same TTFT as a 220-token text prompt (tower + preprocessing < 20 ms;
-the vendored preprocessor is 14 ms/image).
-
-Context caching verified under production-shaped load: a 6-turn agent
-conversation with a growing history (image interleaved) holds ~1 s TTFT per
-turn; a 6 KB system prompt is reused across separate conversations (4.0 ->
-1.0 s); a 12K-token document follow-up hits at 0.7-0.8 s even with zero think
-time; two concurrent streams share a prefix (both 1.5 s); and under 275K
-tokens of distinct fills (past the 262K pool) the LRU eviction path evicts the
-oldest entry, keeps the newest (0.2 s hit), and passes the page-accounting
-integrity check throughout. Known edge: a re-query landing within one decode
-step of the previous identical-prefix request can miss the not-yet-inserted
-prefix and pay one cold prefill (benign, self-heals).
+Prefix caching works for media requests. Image placeholder ids are replaced by a pixel-content hash in the radix cache key, so identical text plus media prefixes hit and different images never false-hit. Repeating an image request drops TTFT from 3.8 to 1.0 s, and a follow-up turn in the same image conversation from 2.8 to 1.1 s. Under production-shaped load, multi-turn agent conversations with interleaved images hold about 1 s TTFT per turn, shared system prompts and long documents hit across conversations, and LRU eviction past the 262K pool keeps the newest entries. One known edge: a re-query landing within one decode step of an identical request can miss the not-yet-inserted prefix and pay one cold prefill.
 
 ## Layout
 
