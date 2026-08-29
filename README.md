@@ -10,7 +10,7 @@ host 内存 offload,PCIe Gen5 x16),单流 decode 从 **17.8 → 35 tok/s(约 2×
 
 因为 GLM-5.3-Flash 路由太平(每 token 激活的 8 个专家彼此几乎不重叠),并发请求的专家取数字节按流数线性叠加、还互相瓜分缓存,而 PCIe 链路早已打满—，批处理摊薄不了这台机器真正计费的东西:字节。
 
-启动参考 `examples/serve_full.sh`(路径按自己机器改;4 槽 256K 上下文 + 全部优化默认开)。
+启动参考 `examples/serve_full.sh`(配置、路径按自己机器改)。
 
 ## 目录
 
