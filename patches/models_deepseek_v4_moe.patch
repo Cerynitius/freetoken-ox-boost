@@ -43,3 +43,37 @@
          cache.ensure_experts(self.layer_id, topk_ids)  # in-place expert-id -> slot
          cache.copy_missing()
          if cache.collect_stats:
+@@ -129,6 +145,11 @@
+         self.gate = Gate(layer_id, args)
+         self.shared_experts = Expert(args.dim, args.moe_inter_dim, args.swiglu_limit)
+         self.experts = DSV4OffloadMoELayer(layer_id, args)
++        # Speculative expert prefetch: the offload layer predicts the NEXT layer's
++        # routing with that layer's own gate (spec_predict_scores below); register
++        # by reference (survives weight load). Inert unless FREETOKEN_MOE_SPEC_PREFETCH>0.
++        if hasattr(self.experts, "spec_set_block"):
++            self.experts.spec_set_block(self)
+ 
+     def forward(self, x: torch.Tensor, input_ids: torch.Tensor) -> torch.Tensor:
+         shape = x.size()
+@@ -144,3 +165,21 @@
+             x, weights.float().contiguous(), indices.to(torch.int32).contiguous()
+         )
+         return (routed + shared).view(shape)
++
++    def spec_predict_scores(self, hidden: torch.Tensor):
++        """Selection scores for the speculative prefetch (same transform chain as
++        Gate.forward minus the gather/renorm). ``None`` for hash-routed layers --
++        their routing depends on input_ids, which the previous layer cannot know."""
++        g = self.gate
++        if g.hash:
++            return None
++        scores = bf16_linear_fp32(hidden, g.weight)
++        if g.score_func == "softmax":
++            scores = scores.softmax(dim=-1)
++        elif g.score_func == "sigmoid":
++            scores = scores.sigmoid()
++        else:
++            scores = F.softplus(scores).sqrt()
++        if g.bias is not None:
++            scores = scores + g.bias
++        return scores

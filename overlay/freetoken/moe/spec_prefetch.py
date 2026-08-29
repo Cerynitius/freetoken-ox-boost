@@ -77,10 +77,19 @@ class SpecPrefetch:
 
         c = self.cache
         b = bank_id % 2
-        logits = F.linear(hidden.float(), blk.gate.weight.float())
-        scores = torch.sigmoid(logits) + blk.e_score_correction_bias.float()
-        if blk.n_group > 1:
-            scores = blk._group_limited(scores)
+        # Pluggable prediction: a block exposing spec_predict_scores (DSV4) supplies
+        # its own gate math; None means this target cannot be predicted (hash-routed
+        # layers) and the prefetch is skipped. Default: the GLM sigmoid+bias gate.
+        pred = getattr(blk, "spec_predict_scores", None)
+        if pred is not None:
+            scores = pred(hidden)
+            if scores is None:
+                return
+        else:
+            logits = F.linear(hidden.float(), blk.gate.weight.float())
+            scores = torch.sigmoid(logits) + blk.e_score_correction_bias.float()
+            if blk.n_group > 1:
+                scores = blk._group_limited(scores)
         ids = torch.topk(scores, count, dim=-1)[1].to(torch.int32).reshape(-1)
         buf = self.ids_buf[b][: ids.numel()]
         buf.copy_(ids)
