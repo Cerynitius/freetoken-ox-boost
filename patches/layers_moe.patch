@@ -1,11 +1,9 @@
 --- a/python/freetoken/layers/moe.py
 +++ b/python/freetoken/layers/moe.py
-@@ -192,8 +192,25 @@
-             apply_router_weight_on_input=self.apply_router_weight_on_input,
-         )
+@@ -194,6 +194,24 @@
          return self._maybe_all_reduce(final_hidden_states)
-+
-+
+ 
+ 
 +# Routing-trace measurement hook (eager only): path to dump (layer, phase, ids).
 +_ROUTE_TRACE = os.environ.get("FREETOKEN_ROUTE_TRACE", "")
 +_ROUTE_TRACE_BUF: list = []
@@ -13,12 +11,13 @@
 +
 +# Fallback-free miss cap: fetch at most N missing experts per layer-step at decode,
 +# DROP the overflow (weight-renormalized). -1 = off (fetch everything, exact).
++_HYBRID_BS1 = os.environ.get("FREETOKEN_MOE_HYBRID_BS1", "0") == "1"
 +_MISS_CAP = int(os.environ.get("FREETOKEN_MOE_MISS_CAP", "-1") or -1)
- 
++
 +# Speculative expert prefetch count per token (0 = off); see moe/spec_prefetch.py.
 +_SPEC_BLOCK_OF: dict = {}  # id(OffloadMoELayer) -> its sparse block (cycle-free)
 +_SPEC_PREFETCH = int(os.environ.get("FREETOKEN_MOE_SPEC_PREFETCH", "0") or 0)
- 
++
 +# Short-prefill on-demand fetch threshold (tokens); 0 disables (always stream).
 +_PREFILL_ONDEMAND_TOKENS = int(os.environ.get("FREETOKEN_PREFILL_ONDEMAND_TOKENS", "48") or 0)
 +
@@ -26,7 +25,7 @@
  class OffloadMoELayer(MoELayer):
      def __init__(
          self,
-@@ -245,6 +262,21 @@
+@@ -245,6 +263,21 @@
          rewrites expert ids into cache slot ids); pass a fresh tensor or a clone.
          """
          ctx = get_global_ctx()
@@ -48,9 +47,17 @@
          if ctx.batch.is_prefill:
              out = self._prefill_routed(hidden_states, topk_weights, topk_ids)
          else:
-@@ -309,9 +341,43 @@
+@@ -307,11 +340,50 @@
+             executor = cache.cpu_executor
+             assert executor is not None, "CPU MoE executor was not initialized"
              return executor.decode(self.layer_id, hidden_states, topk_weights, topk_ids)
-         if cache.decode_target == "hybrid":
+-        if cache.decode_target == "hybrid":
++        if cache.decode_target == "hybrid" and (
++            hidden_states.shape[0] > 1 or _HYBRID_BS1
++        ):
++            # bs==1 keeps the tuned offload path (spec prefetch + LRU): hybrid's CPU
++            # overflow only pays for itself when the union fetch scales with batch.
++            # Static per captured graph -- each bs bakes its own branch.
              return self._decode_hybrid(cache, hidden_states, topk_weights, topk_ids)
 +        pf = self._spec_pf(cache)
 +        if _MISS_CAP >= 0:
@@ -93,19 +100,19 @@
              cache,
              hidden_states,
              topk_weights,
-@@ -321,7 +387,29 @@
+@@ -321,7 +393,29 @@
              alphas=cache.alphas_for_slots(self.layer_id),
              is_prefill=False,
          )
 +        if pf is not None:
 +            pf.launch(self.layer_id, hidden_states)
 +        return out
-+
+ 
 +    def spec_set_block(self, block) -> None:
 +        # Module-level registry, NOT an attribute: block.experts -> layer ->
 +        # block would form a cycle and blow up the module-walking iterators.
 +        _SPEC_BLOCK_OF[id(self)] = block
- 
++
 +    def _spec_pf(self, cache):
 +        """Lazily build the shared SpecPrefetch and register this layer's block."""
 +        if not _SPEC_PREFETCH:
@@ -123,7 +130,7 @@
      def _decode_hybrid(
          self,
          cache: OffloadMoeCache,
-@@ -380,9 +468,65 @@
+@@ -380,9 +474,65 @@
          """Prefill movement: stream whole layers -- double-buffered behind the
          previous layer's GEMMs when ``prefill_overlap`` is on, else a synchronous
          ``materialize_layer``. In both, position == expert id, so the routing ids
