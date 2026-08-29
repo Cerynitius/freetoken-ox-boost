@@ -6,9 +6,10 @@ patch plugin (no upstream code is redistributed).
 
 Running GLM-5.3-Flash-NVFP4 (181 GB of expert weights, host-memory offload,
 PCIe Gen5 x16) on a single RTX PRO 6000 Blackwell 96 GB: single-stream decode
-went from **17.8 to 35 tok/s (~2x)**, 2-way concurrent aggregate 44.9
+went from **17.8 to 36.7 tok/s (~2x)**, 2-way concurrent aggregate 44.9
 (warm topics), 4-way aggregate ~49. Zero quality loss; 48/48 steps match the
-HF reference implementation token for token.
+HF reference implementation token for token. Vision (image input) is supported
+end-to-end — see below.
 
 Why concurrency does not scale here: GLM-5.3-Flash routing is extremely flat
 (the 8 experts each token activates barely overlap between tokens), so
@@ -23,7 +24,7 @@ measurement conditions.
 
 | Metric | Measured | Conditions |
 |---|---|---|
-| Single-stream decode | **35.0 tok/s** (33.8-36.3) | 2-slot 256K pool, warm cache |
+| Single-stream decode | **36.7 tok/s** | 1-slot 256K pool (current default), warm cache |
 | 2-way concurrent aggregate | 44.9 tok/s (warm) / 36-37 (sustained cold topics) | 22.4 / ~18 per stream |
 | 4-way concurrent aggregate | ~49 tok/s | ~12 per stream |
 | MoE cache hit rate | **~84%** (miss 0.157) | 8 resident layers + P=4 prefetch @ 2079 slots; now 2600 slots, slightly better |
@@ -36,13 +37,41 @@ measurement conditions.
 See `examples/serve_full.sh` for a launch reference (adjust paths and
 configuration for your machine).
 
+## Vision support (multimodal GLM-5.3-Flash)
+
+The checkpoint's full `Glm5NextVisionModel` tower (0.6B ViT: Conv3d patch
+embed, 24 attention blocks, 2x2 spatial-merge downsample, clamped-swiglu
+merger) is ported and wired end-to-end through the serving stack:
+
+- `overlay: models/glm5_next/vision.py` — faithful eager port, validated
+  stage-by-stage against the HF reference on the real weights: patch embed and
+  rotary tables bitwise-equal; residual per-layer drift is within the BF16
+  kernel-noise envelope measured between HF's own sdpa and eager backends.
+- `overlay: models/glm5_next/image_process.py` — vendored preprocessing
+  (smart resize -> bicubic -> pad -> CLIP normalize -> patchify), bitwise-equal
+  `pixel_values` vs HF `Glm5NextImageProcessorPil` on test images (the runtime
+  env pins transformers 5.15.x, which has no glm5_next classes). Needs `pillow`.
+- Intake patches (`server_* / tokenizer_* / message_* / scheduler_scheduler`) —
+  images accepted on **both APIs** (OpenAI `image_url` data URI or http URL,
+  Anthropic base64 `image` blocks), chat-template placeholder expansion in the
+  tokenize worker, pixel transport over the ZMQ msgpack codec, and vision
+  encoding at request admission inside the scheduler process (which owns the
+  GPU).
+
+Enable with `FREETOKEN_GLM5_VISION=1` (default off; the BF16 tower costs
+~1.2 GB VRAM, text-only behavior is byte-identical when off). Multi-image
+prompts work; an image prompt must fit in a single prefill chunk, and image
+requests skip prefix caching (upstream behavior). Verified end-to-end on the
+production server: shape/color/position description, object counting,
+two-image comparison, and text-in-image reading through both endpoints.
+
 ## Layout
 
 ```
-patches/    39 per-file unified diffs (against v0.1.2, git apply -p1)
-overlay/    17 new files (the models/glm5_next directory + 4 triton kernels + prefetch/LFU + gpu_select)
+patches/    50 per-file unified diffs (against v0.1.2, git apply -p1)
+overlay/    19 new files (the models/glm5_next directory incl. vision + 4 triton kernels + prefetch/LFU + gpu_select)
 install.sh  version check -> dry-run -> apply -> compileall
-examples/   production launch script (2-slot 256K, all optimizations on by default)
+examples/   production launch script (1-slot 256K, all optimizations on by default)
 MANIFEST.md feature -> files -> switches -> measured numbers
 ```
 

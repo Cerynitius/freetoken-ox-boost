@@ -31,6 +31,22 @@ offload), single-stream decode unless noted.
 | 2-slot 256K KV pool (cache 2079 -> 2600 slots) | single +14%, conc4 +67% | `examples/serve_full.sh` | `GLM5_KV_RESERVE` (524288) |
 | CPU swiglu_clamp support (hybrid backend can serve GLM-5.3) | net-zero on this VM; kernels kept | `patches: kernel_csrc...cpu_moe_ext / moe_cpu_executor / layers_moe (bs gate)` | `GLM5_MOE_BACKEND=hybrid` + `GLM5_CPU_THREADS` |
 
+## Vision support (env-gated, default off)
+
+| Feature | Files | Switch / requirement |
+|---|---|---|
+| Vision tower (0.6B ViT port of `Glm5NextVisionModel`; loads `model.visual.*` BF16 verbatim, +~1.2 GB VRAM) | `overlay: models/glm5_next/vision.py` + wiring in `config.py / weight.py / model.py` | `FREETOKEN_GLM5_VISION` (0) |
+| Image preprocessing (vendored `Glm5NextImageProcessorPil`: smart resize -> bicubic -> pad -> CLIP normalize -> patchify; bitwise-equal pixel_values vs HF) | `overlay: models/glm5_next/image_process.py` | `pip install pillow` |
+| Server intake: OpenAI `image_url` (data URI / http) + Anthropic base64 `image` blocks -> template placeholder expansion -> pixels over the ZMQ msgpack codec -> vision encode at admission in the scheduler process | `patches: server_generation / server_openai_api / server_anthropic_api / tokenizer_tokenize / tokenizer_server / message_tokenizer / message_backend / scheduler_scheduler` | same switch |
+
+Validation: tower parity vs HF stage-by-stage on real weights (patch embed +
+rotary tables bitwise-equal; per-layer drift within the BF16 kernel-noise
+envelope of HF sdpa-vs-eager). End-to-end on the production server: shapes /
+colors / positions, counting, two-image comparison, text-in-image reading, on
+both APIs. Constraints: an image prompt must fit one prefill chunk; image
+requests skip prefix caching (upstream behavior); `count_tokens` does not
+account for image expansion yet.
+
 ## Archived experiments (off by default; verdicts in commit history)
 
 | Experiment | Verdict | Switch |

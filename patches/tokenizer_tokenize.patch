@@ -1,0 +1,40 @@
+--- a/python/freetoken/tokenizer/tokenize.py
++++ b/python/freetoken/tokenizer/tokenize.py
+@@ -21,6 +21,27 @@
+ )
+ 
+ logger = init_logger(__name__)
++
++
++def _expand_image_tokens(prompt: str, images: list) -> str:
++    """Replace the k-th ``<|image|>`` placeholder with that image's token count
++    (grid.prod / merge^2) copies -- mirrors Glm5NextProcessor.replace_image_token.
++    Placeholder count must equal image count; the model asserts the same invariant
++    against the vision features at prefill."""
++    from freetoken.models.glm5_next.image_process import IMAGE_TOKEN, MERGE
++
++    parts = prompt.split(IMAGE_TOKEN)
++    if len(parts) - 1 != len(images):
++        raise ValueError(
++            f"prompt renders {len(parts) - 1} image placeholders but the request "
++            f"carries {len(images)} images"
++        )
++    out = [parts[0]]
++    for img, tail in zip(images, parts[1:]):
++        t, gh, gw = img["grid"]
++        out.append(IMAGE_TOKEN * ((t * gh * gw) // (MERGE * MERGE)))
++        out.append(tail)
++    return "".join(out)
+ 
+ 
+ def resolve_thinking_mode(chat_template_kwargs: dict[str, Any] | None, tools: Any | None) -> str:
+@@ -60,6 +81,9 @@
+         # TODO: batch tokenization
+         for msg in msgs:
+             prompt = self.render_prompt(msg)
++            images = getattr(msg, "images", None)
++            if images:
++                prompt = _expand_image_tokens(prompt, images)
+             # A jinja chat template owns every special token (HF's apply_chat_template
+             # tokenizes with add_special_tokens=False for the same reason): tokenizers
+             # that auto-add bos (muse-glimmer's, llama's) would otherwise double it --

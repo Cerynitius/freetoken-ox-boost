@@ -20,6 +20,8 @@ export FREETOKEN_GLM5_KDA_FP8=${FREETOKEN_GLM5_KDA_FP8:-1}
 # Speculative expert prefetch (P=4 hop-1 no-wait): +8%% single-stream, conc-neutral,
 # zero quality risk (pure cache warming); sweep 2026-08-28: P=2/4/6/8 -> 22.6/22.9/22.4/20.1
 export FREETOKEN_MOE_SPEC_PREFETCH=${FREETOKEN_MOE_SPEC_PREFETCH:-4}
+# Vision (image input on both APIs): +~1.2 GB VRAM for the BF16 tower; needs pillow.
+export FREETOKEN_GLM5_VISION=${FREETOKEN_GLM5_VISION:-1}
 
 MODEL=/home/zrx/glm5-stack/weights/GLM-5.3-Flash-NVFP4
 PORT="${GLM5_PORT:-1920}"

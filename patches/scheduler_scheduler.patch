@@ -17,3 +17,47 @@
  
          # initialize other managers
          self.table_manager = TableManager(config.max_running_req, self.engine.page_table)
+@@ -486,6 +489,43 @@
+                     "Dropping request %d because its abort arrived before admission", msg.uid
+                 )
+                 return
++            if getattr(msg, "mm_images", None):
++                # Vision: encode pixels into soft-token embeddings here -- this process
++                # owns the model/GPU; the tower is a ~0.6B BF16 ViT, a few ms per image.
++                try:
++                    import numpy as np
++
++                    model = self.engine.model
++                    assert hasattr(model, "encode_images"), (
++                        "model is text-only (boot with FREETOKEN_GLM5_VISION=1)"
++                    )
++                    pix_parts, grids = [], []
++                    for d in msg.mm_images:
++                        t, gh, gw = d["grid"]
++                        arr = np.frombuffer(d["pix"], dtype=np.float32).copy()
++                        pix_parts.append(arr.reshape(t * gh * gw, -1))
++                        grids.append([t, gh, gw])
++                    msg.mm_embeds = model.encode_images(
++                        torch.from_numpy(np.concatenate(pix_parts, axis=0)).to(
++                            self.device, torch.bfloat16
++                        ),
++                        torch.tensor(grids, dtype=torch.long, device=self.device),
++                    )
++                    msg.mm_images = None
++                except Exception as exc:  # noqa: BLE001 -- reply, never crash the loop
++                    logger.warning_rank0(
++                        f"vision encode failed for request {msg.uid}: {exc!r}"
++                    )
++                    self.send_result(
++                        [
++                            ErrorReplyMsg(
++                                uid=msg.uid,
++                                error=f"could not encode request images: {exc}",
++                                code="invalid_image",
++                            )
++                        ]
++                    )
++                    return
+             input_len, max_seq_len = len(msg.input_ids), self.engine.max_seq_len
+             max_output_len = max_seq_len - input_len
+             if max_output_len <= 0:

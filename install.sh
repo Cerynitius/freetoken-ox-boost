@@ -47,3 +47,4 @@ cp "$HERE"/overlay/freetoken/gpu_select.py "$TARGET"/python/freetoken/
 
 python3 -m compileall -q "$TARGET"/python/freetoken && echo "== done: syntax check passed =="
 echo "launch example: examples/serve_full.sh; switches: MANIFEST.md"
+echo "vision support needs pillow: pip install pillow (FREETOKEN_GLM5_VISION=1)"
