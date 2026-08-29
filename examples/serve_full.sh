@@ -25,7 +25,7 @@ MODEL=/home/zrx/glm5-stack/weights/GLM-5.3-Flash-NVFP4
 PORT="${GLM5_PORT:-1920}"
 CTX=${GLM5_CTX:-262144}
 # KV pool (tokens) decoupled from the per-request cap: 4-slot 256K = pool 1M.
-KV_RESERVE=${GLM5_KV_RESERVE:-524288}
+KV_RESERVE=${GLM5_KV_RESERVE:-262144}
 
 systemctl --user stop dsv4-freetoken.service 2>/dev/null || true
 systemctl --user stop qwen38-vllm.service 2>/dev/null || true
