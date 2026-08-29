@@ -162,6 +162,12 @@ class Glm5Model(BaseOP):
         return x.mean(dim=1)
 
     def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
+        # Per-forward memo for layer-invariant decode tensors (e.g. the KDA layers'
+        # idx.long(): fla_md.cache_indices is one shared buffer, so one cast serves
+        # all 34 layers instead of one each). Reset here every forward: eager steps
+        # never see a stale entry, and a capture records the single cast which then
+        # re-reads the refreshed int32 buffer on every replay (graph-safe).
+        get_global_ctx().decode_memo = {}
         h = self.embed_tokens.forward(input_ids)  # [total, dim]
         h = h.unsqueeze(1).repeat(1, self.hc_mult, 1)  # [total, hc_mult, dim]
         for layer in self.layers.op_list:

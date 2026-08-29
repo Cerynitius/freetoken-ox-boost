@@ -190,7 +190,14 @@ class KdaAttention(BaseOP):
         idx = fla_md.cache_indices
         # index_select/index_copy_ need int64; the cast kernel re-reads the (refreshed)
         # int32 buffer on every CUDA-graph replay, so this stays graph-safe.
-        idx_l = idx.long()
+        memo = getattr(ctx, "decode_memo", None)
+        if memo is None:
+            idx_l = idx.long()
+        else:
+            idx_l = memo.get(("idx_l", id(idx)))
+            if idx_l is None:
+                idx_l = idx.long()
+                memo[("idx_l", id(idx))] = idx_l
 
         if getattr(batch, "spec_stash", None) is not None:
             # Speculative VERIFY: the batch is k+1 single-token fake reqs of ONE request
