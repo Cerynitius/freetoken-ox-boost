@@ -37,7 +37,7 @@ measurement conditions.
 See `examples/serve_full.sh` for a launch reference (adjust paths and
 configuration for your machine).
 
-## Vision and video
+## Vision, video and caching
 
 The checkpoint's 0.6B ViT tower is ported and wired end to end. Images work on both the OpenAI and Anthropic-style endpoints, video on the OpenAI endpoint via PyAV at 2 fps by default. Enable with FREETOKEN_GLM5_VISION=1, off by default, costs about 1.2 GB VRAM, and the text-only path is byte-identical when off. Preprocessing is bitwise-equal to the HF image processor and tower drift stays within the BF16 noise between HF's own sdpa and eager backends. Verified on the production server for description, counting, two-image comparison, text-in-image, and motion on video. A 220-token image request has the same TTFT as a 220-token text prompt.
 
