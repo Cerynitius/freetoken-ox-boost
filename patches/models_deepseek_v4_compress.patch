@@ -1,0 +1,71 @@
+--- a/python/freetoken/models/deepseek_v4/compress.py
++++ b/python/freetoken/models/deepseek_v4/compress.py
+@@ -13,7 +13,7 @@
+ 
+ from .args import DeepseekV4Args
+ from .layers import Linear, RMSNorm
+-from .ops import apply_rotary_emb, apply_rotary_emb_decode
++from .ops import apply_rotary_emb, apply_rotary_emb_decode, dctx_get
+ 
+ 
+ class Compressor(nn.Module):
+@@ -293,7 +293,7 @@
+ 
+     def decode_step(
+         self, x: torch.Tensor, pos: torch.Tensor, prev_window_slots: torch.Tensor,
+-        window_slots: torch.Tensor, rows: torch.Tensor,
++        window_slots: torch.Tensor, rows: torch.Tensor, dctx=None,
+     ) -> None:
+         """Batched single-token compressor update (EAGER/graph; ``pos``/``prev_window_slots``/
+         ``window_slots`` are GPU int tensors ``[B]``; ``rows`` is the LOCAL row index [B] into the
+@@ -310,11 +310,18 @@
+         dtype = x.dtype
+         item = self.item_size  # the ring's kv|score split point
+         x = x.view(B, -1)
+-        kv = bf16_linear_fp32(x, self.wkv.weight).view(B, 1, item)
+-        score = bf16_linear_fp32(x, self.wgate.weight).view(B, 1, item)
+-        idx_mod = pos % ratio  # [B]
++        # wkv|wgate share the input: one concatenated GEMV instead of two (row-independent
++        # dot products -> identical per-row results). Lazy cat on first (uncaptured) call.
++        w2 = getattr(self, "_kvgate_w", None)
++        if w2 is None:
++            w2 = self._kvgate_w = torch.cat([self.wkv.weight, self.wgate.weight], 0).contiguous()
++        kvs = bf16_linear_fp32(x, w2)
++        kv = kvs[:, :item].view(B, 1, item)
++        score = kvs[:, item:].contiguous().view(B, 1, item)
++        idx_mod = dctx_get(dctx, ("idx_mod", ratio), lambda: pos % ratio)
+         score = score + self.ape.index_select(0, idx_mod).view(B, 1, item)
+-        should = ((pos + 1) % ratio == 0).view(B, 1, 1)
++        should = dctx_get(dctx, ("should", ratio),
++                          lambda: ((pos + 1) % ratio == 0).view(B, 1, 1))
+ 
+         # Read each row's rolling carry block from the PREVIOUS token's page (ks|ss split at item).
+         block = self.attn.read_carry_blocks(  # [B, ring_size, 2*item]
+@@ -449,7 +456,7 @@
+     def decode_step(
+         self, x: torch.Tensor, qr: torch.Tensor, pos: torch.Tensor, offset: int,
+         prev_window_slots: torch.Tensor, window_slots: torch.Tensor, rows: torch.Tensor,
+-        n_stage: int,
++        n_stage: int, dctx=None,
+     ) -> torch.Tensor:
+         """Batched single-token indexer (EAGER/graph). Scores the first ``n_stage`` compressed
+         indexer blocks per row (gathered PER ROW from the paged idx_pool), masks blocks beyond
+@@ -461,13 +468,15 @@
+         B = x.size(0)
+         ratio, rd = self.compress_ratio, self.rope_head_dim
+         q = self.wq_b(qr).unflatten(-1, (self.n_heads, self.head_dim))
+-        apply_rotary_emb_decode(q[..., -rd:], self.freqs_cis.index_select(0, pos))  # per-row freqs
++        apply_rotary_emb_decode(q[..., -rd:], dctx_get(
++            dctx, ("freqs", id(self.freqs_cis)),
++            lambda: self.freqs_cis.index_select(0, pos)))
+         q = hadamard_transform(q)
+         fp4_act_quant_inplace(q, 32)
+         # Advance the indexer's own compressor (writes this token's idx key to idx_pool per row).
+-        self.compressor.decode_step(x, pos, prev_window_slots, window_slots, rows)
++        self.compressor.decode_step(x, pos, prev_window_slots, window_slots, rows, dctx)
+         weights = self.weights_proj(x) * (self.softmax_scale * self.n_heads ** -0.5)
+-        valid = (pos + 1) // ratio  # [B] per-row valid block count
++        valid = dctx_get(dctx, ("valid", ratio), lambda: (pos + 1) // ratio)
+         # Head-reduced scores in one pass: the kernel gathers each block's key off the full-loc
+         # SNAPSHOT (not the live map -> overlap-safe replay) and reads its column bound from
+         # ``valid`` in DEVICE memory, so a captured graph scores only the live blocks instead of

@@ -1,0 +1,22 @@
+--- a/python/freetoken/models/deepseek_v4/ops.py
++++ b/python/freetoken/models/deepseek_v4/ops.py
+@@ -125,3 +125,19 @@
+ 
+ 
+ __all__ = ["precompute_freqs_cis", "apply_rotary_emb", "hc_split_sinkhorn"]
++
++
++def dctx_get(dctx, key, fn):
++    """Per-decode-step memo for layer-invariant tensors (freqs gathers, pos arithmetic).
++    ``dctx`` is a fresh dict per step threaded through the layer loop (wctx precedent):
++    the first layer computes, later layers reuse -- one kernel per step instead of one
++    per layer. ``None`` (standalone callers) falls back to computing locally. Graph-safe:
++    the dict is host-side capture-time state; the cached tensors are captured once and
++    refreshed per replay like any other in-graph computation."""
++    if dctx is None:
++        return fn()
++    v = dctx.get(key)
++    if v is None:
++        v = fn()
++        dctx[key] = v
++    return v

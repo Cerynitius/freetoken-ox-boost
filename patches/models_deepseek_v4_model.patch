@@ -33,6 +33,20 @@
          return y, post.view(M, self.hc_mult), comb.view(M, self.hc_mult, self.hc_mult)
  
      def hc_post(self, x, residual, post, comb):
+@@ -112,11 +116,11 @@
+         x = self.hc_post(x, residual, post, comb)
+         return x
+ 
+-    def decode_step(self, x, pos, rows, cmp_stage_cap, input_ids, wctx=None):
++    def decode_step(self, x, pos, rows, cmp_stage_cap, input_ids, wctx=None, dctx=None):
+         residual = x
+         x, post, comb = self.hc_pre(x, self.hc_attn_fn, self.hc_attn_scale, self.hc_attn_base)
+         x = self.attn_norm(x)
+-        x = self.attn.decode_step(x, pos, rows, cmp_stage_cap, wctx)
++        x = self.attn.decode_step(x, pos, rows, cmp_stage_cap, wctx, dctx)
+         x = self.hc_post(x, residual, post, comb)
+ 
+         residual = x
 @@ -151,12 +155,12 @@
      def hc_head(self, x):
          shape, dtype = x.size(), x.dtype
@@ -51,3 +65,16 @@
  
      def prefill_batched(
          self, input_ids: torch.Tensor, segments, flat_positions: torch.Tensor,
+@@ -202,8 +206,11 @@
+         # into every layer. They read only the shared snapshot / positions, so they are identical
+         # across layers.
+         wctx = get_global_ctx().batch.attn_metadata.window_ctx(pos, rows)
++        # Layer-invariant decode memo (freqs gathers, pos arithmetic): fresh per step,
++        # first layer fills, the other 42 reuse. See ops.dctx_get.
++        dctx = {}
+         for layer in self.layers:
+-            h = layer.decode_step(h, pos, rows, cmp_stage_cap, input_ids, wctx)
++            h = layer.decode_step(h, pos, rows, cmp_stage_cap, input_ids, wctx, dctx)
+         h = self.hc_head(h)
+         h = self.norm(h)
+         return F.linear(h[:, -1], self.head)

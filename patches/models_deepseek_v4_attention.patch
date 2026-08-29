@@ -1,0 +1,59 @@
+--- a/python/freetoken/models/deepseek_v4/attention.py
++++ b/python/freetoken/models/deepseek_v4/attention.py
+@@ -14,7 +14,7 @@
+ from .args import DeepseekV4Args
+ from .compress import Compressor, Indexer
+ from .layers import Linear, RMSNorm, get_compress_topk_idxs, get_window_topk_idxs
+-from .ops import apply_rotary_emb, apply_rotary_emb_decode, get_freqs_cis
++from .ops import apply_rotary_emb, apply_rotary_emb_decode, dctx_get, get_freqs_cis
+ 
+ 
+ class Attention(nn.Module):
+@@ -248,7 +248,7 @@
+ 
+     def decode_step(
+         self, x: torch.Tensor, pos: torch.Tensor, rows: torch.Tensor, cmp_stage_cap: int,
+-        wctx=None,
++        wctx=None, dctx=None,
+     ) -> torch.Tensor:
+         """Batched single-token attention (EAGER/graph). Per row, builds the per-query top-k as
+         GLOBAL pool slots -- the live 128-window ring slots (window-first) then the first
+@@ -273,7 +273,10 @@
+         if wctx is None:
+             wctx = get_global_ctx().batch.attn_metadata.window_ctx(pos, rows)
+         window_slots, prev_window_slots, window_slots_topk = wctx
+-        freqs_t = self.freqs_cis.index_select(0, pos)  # [B, rd_pairs] (per-layer rope)
++        # freqs_cis is get_freqs_cis-memoized and SHARED across same-param layers, so the
++        # id() key dedups the gather to one per rope variant per step (was one per layer).
++        freqs_t = dctx_get(dctx, ("freqs", id(self.freqs_cis)),
++                           lambda: self.freqs_cis.index_select(0, pos))
+ 
+         qr = q = self.q_norm(self.wq_a(x))
+         q = self.wq_b(q).unflatten(-1, (self.n_heads, self.head_dim))
+@@ -292,12 +295,12 @@
+         n_window = win
+         cmp_counts = None
+         if self.compress_ratio:
+-            self.compressor.decode_step(x, pos, prev_window_slots, window_slots, rows)
+-            valid = (pos + 1) // ratio  # [B] per-row compressed block count
++            self.compressor.decode_step(x, pos, prev_window_slots, window_slots, rows, dctx)
++            valid = dctx_get(dctx, ("valid", ratio), lambda: (pos + 1) // ratio)
+             if self.indexer is not None:
+                 # Indexer returns the selected BLOCK indices (offset 0) into [0, n_cmp_stage) or -1.
+                 blocks = self.indexer.decode_step(
+-                    x, qr, pos, 0, prev_window_slots, window_slots, rows, n_cmp_stage
++                    x, qr, pos, 0, prev_window_slots, window_slots, rows, n_cmp_stage, dctx
+                 )  # [B, 1, k] block index or -1
+             else:
+                 # Each valid block b is its own pick (column order = block order); invalid -> -1.
+@@ -311,7 +314,9 @@
+             # order, and the indexer's top-k sorts its -1 picks (score -inf) last. So one count per
+             # row bounds the kernel's loop -- read from DEVICE memory, so the captured graph's work
+             # tracks the live position instead of the staged width.
+-            cmp_counts = valid.clamp(max=compress_idxs.shape[-1]).to(torch.int32).view(B, 1)
++            cmp_counts = dctx_get(
++                dctx, ("cmpc", ratio, compress_idxs.shape[-1]),
++                lambda: valid.clamp(max=compress_idxs.shape[-1]).to(torch.int32).view(B, 1))
+         else:
+             topk_idxs = window_slots_topk
+         topk_idxs = topk_idxs.int()
