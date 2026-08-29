@@ -19,7 +19,7 @@
 |---|---|---|---|
 | 非专家 FP8(attn/mlp) | +28%,prefill 2.7× | `models/glm5_next/{attention,mlp,weight}.py` | `FREETOKEN_GLM5_ATTN_FP8`/`MLP_FP8`(1) |
 | KDA FP8(in_proj+o_proj) | +15% | 同上 | `FREETOKEN_GLM5_KDA_FP8`(1) |
-| 热度常驻层 3-10 | +29%(miss 0.24→0.157) | `models/glm5_next/experts_resident.py` + `patches: models_glm_moe_dsa_moe` | `FREETOKEN_GLM5_RESIDENT_LAYERS`(3-10) |
+| 热度常驻层(coding 踪迹重挑 3-6,8-11) | +29%(miss 0.24→0.157);coding 6000 步仿真与 3-10 并列 | `models/glm5_next/experts_resident.py` + `patches: models_glm_moe_dsa_moe` | `FREETOKEN_GLM5_RESIDENT_LAYERS`(3-6,8-11) |
 | 投机专家预取(L+1 gate 提前打分) | +8%(P=4 hop-1 甜点) | `overlay: moe/spec_prefetch.py` + `patches: layers_moe` | `FREETOKEN_MOE_SPEC_PREFETCH`(0;生产设 4) |
 | 短 prompt 按需 prefill | TTFT 3.5×(10-tok 2.1→0.59s) | `patches: layers_moe` | `FREETOKEN_PREFILL_ONDEMAND_TOKENS`(48;0=关) |
 | marlin decode GEMV 配置 16/32/2 | +4.5%(gate_up 核 −15%) | `patches: moe_fused_nvfp4` | `FREETOKEN_MARLIN_BN/BKW/WARPS`(16/32/2) |

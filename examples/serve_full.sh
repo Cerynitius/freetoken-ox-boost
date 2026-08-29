@@ -11,7 +11,7 @@ export CUDA_HOME=/usr/local/cuda-13.0
 export PATH=/home/zrx/miniconda3/envs/freetoken/bin:$CUDA_HOME/bin:$PATH
 export HF_HOME=/home/zrx/glm5-stack/hf_home
 export HF_HUB_OFFLINE=1
-export FREETOKEN_GLM5_RESIDENT_LAYERS=${FREETOKEN_GLM5_RESIDENT_LAYERS:-3-10}
+export FREETOKEN_GLM5_RESIDENT_LAYERS=${FREETOKEN_GLM5_RESIDENT_LAYERS:-3-6,8-11}
 # Non-expert FP8: +28% decode, 2.7x prefill; quality gates passed 2026-08-28 (tool
 # calls, >2048 needle, coherence). lm_head stays BF16 (rare-word protection).
 export FREETOKEN_GLM5_ATTN_FP8=${FREETOKEN_GLM5_ATTN_FP8:-1}
