@@ -26,7 +26,31 @@
          if self.score_func == "softmax":
              scores = scores.softmax(dim=-1)
          elif self.score_func == "sigmoid":
-@@ -100,10 +112,14 @@
+@@ -66,7 +78,22 @@
+         self.swiglu_limit = swiglu_limit
+ 
+     def forward(self, x: torch.Tensor) -> torch.Tensor:
+-        h = fused_swiglu(self.w1(x), self.w3(x), self.swiglu_limit, x.dtype)
++        # w1|w3 share input x: one block-fp8 GEMV, output [..., 2I] fed straight to
++        # the gate_up-halves swiglu kernel (same math as the two-arg variant).
++        # Valid when w1's out rows land on a 128-scale-block boundary; else fallback.
++        w13 = getattr(self, "_w13", None)
++        if w13 is None and self.w1.kind == "fp8" and self.w3.kind == "fp8" and self.w1.weight.shape[0] % 128 == 0:
++            w = torch.cat([self.w1.weight.view(torch.uint8), self.w3.weight.view(torch.uint8)], 0)
++            self._w13 = w13 = w.view(self.w1.weight.dtype)
++            self._w13_s = torch.cat([self.w1.scale, self.w3.scale], 0).contiguous()
++        if w13 is not None:
++            from freetoken.kernel.triton.dsv4.fp8_linear import block_fp8_linear
++            from freetoken.kernel.triton.dsv4.fused_moe import fused_swiglu as _gu_swiglu
++
++            gu = block_fp8_linear(x, w13, self._w13_s, None)
++            h = _gu_swiglu(gu, self.swiglu_limit).to(x.dtype)
++        else:
++            h = fused_swiglu(self.w1(x), self.w3(x), self.swiglu_limit, x.dtype)
+         return self.w2(h)
+ 
+ 
+@@ -100,10 +127,14 @@
          # keeps short-prompt slot residency -- hence hybrid decode's GPU/CPU
          # route split -- unchanged). Mixing modes across chunks is safe: the
          # streaming buffers disown their borrowed slots on invalidation.
@@ -43,7 +67,7 @@
          cache.ensure_experts(self.layer_id, topk_ids)  # in-place expert-id -> slot
          cache.copy_missing()
          if cache.collect_stats:
-@@ -129,6 +145,11 @@
+@@ -129,6 +160,11 @@
          self.gate = Gate(layer_id, args)
          self.shared_experts = Expert(args.dim, args.moe_inter_dim, args.swiglu_limit)
          self.experts = DSV4OffloadMoELayer(layer_id, args)
@@ -55,7 +79,7 @@
  
      def forward(self, x: torch.Tensor, input_ids: torch.Tensor) -> torch.Tensor:
          shape = x.size()
-@@ -144,3 +165,21 @@
+@@ -144,3 +180,21 @@
              x, weights.float().contiguous(), indices.to(torch.int32).contiguous()
          )
          return (routed + shared).view(shape)

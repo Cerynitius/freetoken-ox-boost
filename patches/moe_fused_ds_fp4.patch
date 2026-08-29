@@ -9,7 +9,29 @@
  import torch
  import triton
  
-@@ -210,10 +212,24 @@
+@@ -67,9 +69,18 @@
+     # BKB=128/1 warp maximizes memory-level parallelism (many single-warp CTAs, no
+     # cross-warp reduction) -> ~950 GB/s on H100 (was ~830 at BN=8/BKB=256/2). K_BYTES
+     # must be a multiple of BLOCK_SIZE_KB (gate_up 2048, down 1024 -- both /128).
+-    BLOCK_SIZE_N = 16
+-    BLOCK_SIZE_KB = 128
+-    _NW = 1
++    # 2026-08-29 RTX PRO 6000 sweep (bench_dsfp4.py, real DSV4-Flash geometry):
++    # gate_up 47.0us -> 41.8us at 8/128/1 (-11%), down 25.1 -> 23.1 at 32/128/4 (-8%).
++    # The H100-tuned 16/128/1 stays the env-overridable fallback.
++    import os as _os
++    if a_row_is_route:  # down projection
++        BLOCK_SIZE_N = int(_os.environ.get("FREETOKEN_DSFP4_DOWN_BN", "32"))
++        BLOCK_SIZE_KB = int(_os.environ.get("FREETOKEN_DSFP4_DOWN_BKB", "128"))
++        _NW = int(_os.environ.get("FREETOKEN_DSFP4_DOWN_WARPS", "4"))
++    else:               # gate_up
++        BLOCK_SIZE_N = int(_os.environ.get("FREETOKEN_DSFP4_GU_BN", "8"))
++        BLOCK_SIZE_KB = int(_os.environ.get("FREETOKEN_DSFP4_GU_BKB", "128"))
++        _NW = int(_os.environ.get("FREETOKEN_DSFP4_GU_WARPS", "1"))
+     assert (K // 2) % BLOCK_SIZE_KB == 0, (K, BLOCK_SIZE_KB)
+     grid = (total_routes, triton.cdiv(N, BLOCK_SIZE_N))
+     _decode_dsfp4_moe_kernel[grid](
+@@ -210,10 +221,24 @@
      # One static config for every density (no autotune): the kernel is
      # dequant-floor-bound, so per-expert padding at BLOCK_M=64 costs the same
      # as tighter tiles while keeping the wgmma-wide M tile on sm_90.

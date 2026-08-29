@@ -9,7 +9,36 @@
  
  
  class Attention(nn.Module):
-@@ -248,7 +248,7 @@
+@@ -182,7 +182,27 @@
+         else:
+             freqs = self.freqs_cis.index_select(0, flat_positions)  # [T, rd//2] per-token rope
+ 
+-        qr = q = self.q_norm(self.wq_a(x))
++        # wq_a|wkv share input x: one block-fp8 GEMV (and one act_quant) instead of
++        # two. Valid because q_lora_rank % 128 == 0, so wkv's 128x128 scale blocks
++        # start on a fresh block row after the cat; guarded otherwise. Slices are
++        # made contiguous (decode B is small) since downstream kernels index flat.
++        _mw = getattr(self, "_qakv_w", None)
++        if _mw is None and self.wq_a.weight.shape[0] % 128 == 0 and self.wq_a.kind == "fp8" and self.wkv.kind == "fp8":
++            import torch as _t
++            _w = _t.cat([self.wq_a.weight.view(_t.uint8), self.wkv.weight.view(_t.uint8)], 0)
++            self._qakv_w = _w.view(self.wq_a.weight.dtype)
++            self._qakv_s = _t.cat([self.wq_a.scale, self.wkv.scale], 0).contiguous()
++            self._qakv_split = self.wq_a.weight.shape[0]
++            _mw = self._qakv_w
++        if _mw is not None:
++            from freetoken.kernel.triton.dsv4.fp8_linear import block_fp8_linear
++            _qakv = block_fp8_linear(x, _mw, self._qakv_s, None)
++            _qa = _qakv[..., : self._qakv_split].contiguous()
++            _kv_pre = _qakv[..., self._qakv_split :].contiguous()
++        else:
++            _qa = self.wq_a(x)
++            _kv_pre = None
++        qr = q = self.q_norm(_qa)
+         q = self.wq_b(q).unflatten(-1, (self.n_heads, self.head_dim))
+         q = rms_norm(q, None, self.eps)
+         apply_rotary_emb(q[..., -rd:], freqs)
+@@ -248,7 +268,7 @@
  
      def decode_step(
          self, x: torch.Tensor, pos: torch.Tensor, rows: torch.Tensor, cmp_stage_cap: int,
@@ -18,7 +47,7 @@
      ) -> torch.Tensor:
          """Batched single-token attention (EAGER/graph). Per row, builds the per-query top-k as
          GLOBAL pool slots -- the live 128-window ring slots (window-first) then the first
-@@ -273,7 +273,10 @@
+@@ -273,14 +293,33 @@
          if wctx is None:
              wctx = get_global_ctx().batch.attn_metadata.window_ctx(pos, rows)
          window_slots, prev_window_slots, window_slots_topk = wctx
@@ -28,9 +57,34 @@
 +        freqs_t = dctx_get(dctx, ("freqs", id(self.freqs_cis)),
 +                           lambda: self.freqs_cis.index_select(0, pos))
  
-         qr = q = self.q_norm(self.wq_a(x))
+-        qr = q = self.q_norm(self.wq_a(x))
++        _mw = getattr(self, "_qakv_w", None)
++        if _mw is None and self.wq_a.weight.shape[0] % 128 == 0 and self.wq_a.kind == "fp8" and self.wkv.kind == "fp8":
++            import torch as _t
++            _w = _t.cat([self.wq_a.weight.view(_t.uint8), self.wkv.weight.view(_t.uint8)], 0)
++            self._qakv_w = _w.view(self.wq_a.weight.dtype)
++            self._qakv_s = _t.cat([self.wq_a.scale, self.wkv.scale], 0).contiguous()
++            self._qakv_split = self.wq_a.weight.shape[0]
++            _mw = self._qakv_w
++        if _mw is not None:
++            from freetoken.kernel.triton.dsv4.fp8_linear import block_fp8_linear
++            _qakv = block_fp8_linear(x, _mw, self._qakv_s, None)
++            _qa = _qakv[..., : self._qakv_split].contiguous()
++            _kv_pre = _qakv[..., self._qakv_split :].contiguous()
++        else:
++            _qa = self.wq_a(x)
++            _kv_pre = None
++        qr = q = self.q_norm(_qa)
          q = self.wq_b(q).unflatten(-1, (self.n_heads, self.head_dim))
-@@ -292,12 +295,12 @@
+         q = rms_norm(q, None, self.eps)
+         apply_rotary_emb_decode(q[..., -rd:], freqs_t)  # per-row position freqs
+ 
+-        kv = self.wkv(x)
++        kv = _kv_pre if _kv_pre is not None else self.wkv(x)
+         kv = self.kv_norm(kv)
+         apply_rotary_emb_decode(kv[..., -rd:], freqs_t)
+         act_quant_fp8_inplace(kv[..., :-rd], 64)
+@@ -292,12 +331,12 @@
          n_window = win
          cmp_counts = None
          if self.compress_ratio:
@@ -46,7 +100,7 @@
                  )  # [B, 1, k] block index or -1
              else:
                  # Each valid block b is its own pick (column order = block order); invalid -> -1.
-@@ -311,7 +314,9 @@
+@@ -311,7 +350,9 @@
              # order, and the indexer's top-k sorts its -1 picks (score -inf) last. So one count per
              # row bounds the kernel's loop -- read from DEVICE memory, so the captured graph's work
              # tracks the live position instead of the staged width.
