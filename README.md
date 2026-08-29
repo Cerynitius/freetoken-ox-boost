@@ -25,7 +25,6 @@ host 内存 offload,PCIe Gen5 x16),单流 decode 从 **17.8 → 35 tok/s(约 2×
 | TTFT(2.7K token) | 3.12 s(prefill 852 tok/s) | 流式 prefill |
 | 232K 长上下文 prefill | 232 s(~1030 tok/s) | 10%/50%/95% 三针 needle 全中 |
 | 232K 上下文后 decode | 25.1 tok/s | 单槽 256K 配置实测,几乎无损 |
-| 质量 | MMLU-100 **94**(bf16 89 / fp8 87) | 48/48 步与 HF 参考逐 token 一致 |
 
 启动参考 `examples/serve_full.sh`(配置、路径按自己机器改)。
 
