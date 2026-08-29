@@ -1,0 +1,53 @@
+--- a/python/freetoken/models/deepseek_v4/model.py
++++ b/python/freetoken/models/deepseek_v4/model.py
+@@ -28,6 +28,7 @@
+ from freetoken.core import get_global_ctx
+ from freetoken.kernel.triton.dsv4.hc import hc_post_combine, hc_pre_combine
+ from freetoken.kernel.triton.dsv4.sinkhorn import hc_split_sinkhorn
++from freetoken.kernel.triton.dsv4.hc_norm import hc_mix_gemv, hc_rms_cast
+ from freetoken.models.blocks import BaseLLMModel
+ 
+ from .args import DeepseekV4Args
+@@ -72,15 +73,18 @@
+         self.hc_ffn_scale = nn.Parameter(torch.empty(3, dtype=torch.float32), requires_grad=False)
+ 
+     def hc_pre(self, x, hc_fn, hc_scale, hc_base):
++        # tail-fusion (ported from glm5_next 2026-08-29): cast+square+mean+rsqrt -> one
++        # kernel; gemv with rsqrt epilogue -> one kernel; pre_combine upcasts bf16
++        # in-register (the eager chain was ~7 launches + two fp32 casts per call).
+         shape, dtype = x.size(), x.dtype
+-        xf = x.flatten(2).float()
+-        rsqrt = torch.rsqrt(xf.square().mean(-1, keepdim=True) + self.norm_eps)
+-        mixes = F.linear(xf, hc_fn) * rsqrt
++        x2 = x.flatten(2)
++        M = shape[0] * shape[1]
++        xf, rs = hc_rms_cast(x2.reshape(M, -1), self.norm_eps)
++        mixes = hc_mix_gemv(xf, hc_fn, rs)
+         pre, post, comb = hc_split_sinkhorn(
+-            mixes.view(-1, mixes.size(-1)), hc_scale, hc_base, self.hc_mult, self.hc_sinkhorn_iters, self.hc_eps
++            mixes, hc_scale, hc_base, self.hc_mult, self.hc_sinkhorn_iters, self.hc_eps
+         )
+-        M = shape[0] * shape[1]
+-        y = hc_pre_combine(xf.view(M, self.hc_mult, self.dim), pre, dtype).view(*shape[:2], self.dim)
++        y = hc_pre_combine(x2.reshape(M, self.hc_mult, self.dim), pre, dtype).view(*shape[:2], self.dim)
+         return y, post.view(M, self.hc_mult), comb.view(M, self.hc_mult, self.hc_mult)
+ 
+     def hc_post(self, x, residual, post, comb):
+@@ -151,12 +155,12 @@
+     def hc_head(self, x):
+         shape, dtype = x.size(), x.dtype
+         dim = self.args.dim
+-        xf = x.flatten(2).float()
+-        rsqrt = torch.rsqrt(xf.square().mean(-1, keepdim=True) + self.norm_eps)
+-        mixes = F.linear(xf, self.hc_head_fn) * rsqrt
+-        pre = torch.sigmoid(mixes * self.hc_head_scale + self.hc_head_base) + self.hc_eps
++        x2 = x.flatten(2)
+         M = shape[0] * shape[1]
+-        return hc_pre_combine(xf.view(M, self.hc_mult, dim), pre.view(M, self.hc_mult), dtype).view(*shape[:2], dim)
++        xf, rs = hc_rms_cast(x2.reshape(M, -1), self.norm_eps)
++        mixes = hc_mix_gemv(xf, self.hc_head_fn, rs)
++        pre = torch.sigmoid(mixes * self.hc_head_scale + self.hc_head_base) + self.hc_eps
++        return hc_pre_combine(x2.reshape(M, self.hc_mult, dim), pre.view(M, self.hc_mult), dtype).view(*shape[:2], dim)
+ 
+     def prefill_batched(
+         self, input_ids: torch.Tensor, segments, flat_positions: torch.Tensor,
