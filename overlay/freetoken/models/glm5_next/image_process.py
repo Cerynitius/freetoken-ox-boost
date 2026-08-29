@@ -12,6 +12,7 @@ Conv3d view expects). Output: pixel_values [P, 3*2*14*14] fp32 + grid (1, gh, gw
 from __future__ import annotations
 
 import math
+import os
 
 import numpy as np
 
@@ -19,7 +20,9 @@ PATCH = 14
 MERGE = 2
 TEMPORAL = 2
 MIN_TOKENS = 16
-MAX_TOKENS = 8000
+# Patch budget per image (HF default 8000 patches = 2000 LM tokens after the 2x2
+# merge). Lower it to trade large-image fidelity for prompt length / encode time.
+MAX_TOKENS = int(os.getenv("FREETOKEN_GLM5_MAX_IMAGE_TOKENS", "8000"))
 IMAGE_TOKEN = "<|image|>"
 _MEAN = np.array([0.48145466, 0.4578275, 0.40821073], dtype=np.float32).reshape(3, 1, 1)
 _STD = np.array([0.26862954, 0.26130258, 0.27577711], dtype=np.float32).reshape(3, 1, 1)
@@ -136,4 +139,130 @@ def decode_image_part(image_url):
     return Image.open(io.BytesIO(raw))
 
 
-__all__ = ["preprocess_image", "decode_image_part", "smart_resize", "IMAGE_TOKEN", "MERGE"]
+
+
+
+# ---------------------------------------------------------------------------------
+# Video: sampled frames -> patch grid (t, gh, gw). Mirrors HF Glm5NextVideoProcessor
+# (same smart_resize with a frame-count-aware budget, same content-box + zero-pad,
+# same paired-frame temporal patchify); resize uses PIL bicubic like our image path
+# (HF's video backend is torchvision -- visually identical, not bitwise).
+# ---------------------------------------------------------------------------------
+VIDEO_FPS = float(os.getenv("FREETOKEN_GLM5_VIDEO_FPS", "2"))
+# Patch budget for the WHOLE clip (HF default 240000 -> 60000 LM tokens, far beyond
+# what a PCIe-offload box should prefill). 8000 patches = 2000 LM tokens.
+MAX_VIDEO_TOKENS = int(os.getenv("FREETOKEN_GLM5_MAX_VIDEO_TOKENS", "8000"))
+MAX_VIDEO_FRAMES = int(os.getenv("FREETOKEN_GLM5_MAX_VIDEO_FRAMES", "64"))
+_MAX_VIDEO_BYTES = 128 * 1024 * 1024
+
+
+def sample_frame_indices(total_frames: int, native_fps: float, duration: float):
+    """Frame indices at FREETOKEN_GLM5_VIDEO_FPS spacing, even count (HF sampler)."""
+    max_seconds = int(duration) if duration else max(1, round(total_frames / max(native_fps, 1e-6)))
+    extract_t = min(int(max(duration, 1e-6) * VIDEO_FPS) or 2, MAX_VIDEO_FRAMES)
+    timestamps = [i / max(native_fps, 1e-6) for i in range(total_frames)]
+    if total_frames < extract_t:
+        idx = np.linspace(0, total_frames - 1, extract_t, dtype=int).tolist()
+    else:
+        idx = []
+        current = 0.0
+        inv = 1.0 / VIDEO_FPS
+        for i in range(total_frames):
+            if timestamps[i] >= current:
+                current += inv
+                idx.append(i)
+                if current >= max_seconds:
+                    break
+        if len(idx) < extract_t:
+            a, b = (idx[0], idx[-1]) if idx else (0, max(total_frames - 1, 0))
+            idx = np.linspace(a, b, extract_t, dtype=int).tolist()
+        elif len(idx) > extract_t:
+            idx = np.linspace(0, total_frames - 1, extract_t, dtype=int).tolist()
+    seen, uniq = set(), []
+    for i in idx:
+        if i not in seen:
+            seen.add(i); uniq.append(i)
+    if len(uniq) & 1:
+        uniq.append(uniq[-1])
+    ts = [timestamps[i] for i in uniq]
+    return uniq, ts
+
+
+def preprocess_video(frames, timestamps):
+    """frames: even-length list of PIL images (same size). Returns
+    (pixel_values [t*gh*gw, D] fp32, grid (t, gh, gw), unit_timestamps [t])."""
+    from PIL import Image
+
+    T = len(frames)
+    assert T >= 2 and T % 2 == 0, "sampled frame count must be even"
+    frames = [f.convert("RGB") for f in frames]
+    width, height = frames[0].size
+    factor = PATCH * MERGE
+    target_h, target_w = smart_resize(
+        T, height, width, temporal_factor=TEMPORAL, factor=factor,
+        min_pixels=MIN_TOKENS, max_pixels=MAX_VIDEO_TOKENS,
+    )
+    pixels_per_token = TEMPORAL * factor**2
+    scale = min(target_h / height, target_w / width)
+    if T * height * width >= pixels_per_token * MIN_TOKENS:
+        scale = min(1.0, scale)
+    content_h = max(1, min(target_h, math.floor(height * scale)))
+    content_w = max(1, min(target_w, math.floor(width * scale)))
+    chw = []
+    for f in frames:
+        if (content_h, content_w) != (height, width):
+            f = f.resize((content_w, content_h), Image.BICUBIC)
+        a = np.asarray(f, dtype=np.uint8).transpose(2, 0, 1)
+        a = np.pad(a, ((0, 0), (0, target_h - content_h), (0, target_w - content_w)))
+        chw.append(a)
+    vid = np.stack(chw).astype(np.float32) / 255.0          # [T, C, H, W]
+    vid = (vid - _MEAN[None]) / _STD[None]
+    grid_t, gh, gw = T // TEMPORAL, target_h // PATCH, target_w // PATCH
+    x = vid.reshape(grid_t, TEMPORAL, 3, gh // MERGE, MERGE, PATCH, gw // MERGE, MERGE, PATCH)
+    x = np.transpose(x, (0, 3, 6, 4, 7, 2, 1, 5, 8))        # unit, block-major, m, m, C, T, ph, pw
+    flat = np.ascontiguousarray(
+        x.reshape(grid_t * gh * gw, 3 * TEMPORAL * PATCH * PATCH)
+    )
+    unit_ts = [float(timestamps[min(k * TEMPORAL, T - 1)]) for k in range(grid_t)]
+    return flat, (grid_t, gh, gw), unit_ts
+
+
+def decode_video_part(video_url):
+    """OpenAI-style video_url payload -> (frames list of PIL, unit timestamps).
+    data: URI (base64 mp4/webm) or http(s) URL; decoded via PyAV."""
+    import base64
+    import io
+    import tempfile
+    import urllib.request
+
+    import av
+    from PIL import Image
+
+    url = video_url.get("url") if isinstance(video_url, dict) else video_url
+    if not isinstance(url, str) or not url:
+        raise ValueError("video_url must be a non-empty string or {'url': ...}")
+    if url.startswith("data:"):
+        _, _, b64 = url.partition(",")
+        raw = base64.b64decode(b64)
+    elif url.startswith(("http://", "https://")):
+        req = urllib.request.Request(url, headers={"User-Agent": "freetoken-vision"})
+        with urllib.request.urlopen(req, timeout=30) as r:
+            raw = r.read(_MAX_VIDEO_BYTES + 1)
+    else:
+        raise ValueError("video_url must be a data: URI or http(s) URL")
+    if len(raw) > _MAX_VIDEO_BYTES:
+        raise ValueError("video too large (>128MB)")
+
+    with av.open(io.BytesIO(raw)) as container:
+        stream = container.streams.video[0]
+        native_fps = float(stream.average_rate or 24.0)
+        decoded = [f for f in container.decode(stream)]
+    total = len(decoded)
+    if total == 0:
+        raise ValueError("could not decode any video frames")
+    duration = total / max(native_fps, 1e-6)
+    idx, ts = sample_frame_indices(total, native_fps, duration)
+    frames = [Image.fromarray(decoded[i].to_ndarray(format="rgb24")) for i in idx]
+    return frames, ts
+
+__all__ = ["preprocess_image", "decode_image_part", "preprocess_video", "decode_video_part", "smart_resize", "IMAGE_TOKEN", "MERGE"]

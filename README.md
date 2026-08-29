@@ -60,15 +60,35 @@ merger) is ported and wired end-to-end through the serving stack:
 
 Enable with `FREETOKEN_GLM5_VISION=1` (default off; the BF16 tower costs
 ~1.2 GB VRAM, text-only behavior is byte-identical when off). Multi-image
-prompts work; an image prompt must fit in a single prefill chunk, and image
-requests skip prefix caching (upstream behavior). Verified end-to-end on the
-production server: shape/color/position description, object counting,
-two-image comparison, and text-in-image reading through both endpoints.
+prompts work; an image prompt must fit in a single prefill chunk. Verified
+end-to-end on the production server: shape/color/position description, object
+counting, two-image comparison, and text-in-image reading through both
+endpoints.
+
+**Video input** is supported on the OpenAI endpoint (`{"type": "video_url"}`
+content parts, data URI or http URL; decoded via PyAV): frames are sampled at
+`FREETOKEN_GLM5_VIDEO_FPS` (2), paired into temporal patches, and expanded
+into per-second frame blocks with timestamps exactly like the HF processor.
+Budgets: `FREETOKEN_GLM5_MAX_VIDEO_TOKENS` (8000 patches for the whole clip),
+`FREETOKEN_GLM5_MAX_VIDEO_FRAMES` (64). Verified: motion direction,
+start/end positions, and colors on a synthetic clip.
+
+**Prefix caching works for image and video requests** (this patch set makes it
+content-safe): each image span's placeholder ids are replaced by a per-image
+pixel-content hash in the radix cache keys, so identical text+media prefixes
+hit while different images diverge at the span's first token. Measured on the
+production box: repeating the same image request drops TTFT 3.8 -> 1.0 s;
+different images never false-hit; a follow-up turn in the same image
+conversation drops 2.8 -> 1.1 s (with `--cache-type radix` and
+`FREETOKEN_PREFILL_ONDEMAND_TOKENS=128`, both now the example defaults).
+Vision-specific overhead is otherwise negligible: a 220-token image request
+has the same TTFT as a 220-token text prompt (tower + preprocessing < 20 ms;
+the vendored preprocessor is 14 ms/image).
 
 ## Layout
 
 ```
-patches/    50 per-file unified diffs (against v0.1.2, git apply -p1)
+patches/    53 per-file unified diffs (against v0.1.2, git apply -p1)
 overlay/    19 new files (the models/glm5_next directory incl. vision + 4 triton kernels + prefetch/LFU + gpu_select)
 install.sh  version check -> dry-run -> apply -> compileall
 examples/   production launch script (1-slot 256K, all optimizations on by default)

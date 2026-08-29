@@ -32,9 +32,9 @@ def _rotate_half(x: torch.Tensor) -> torch.Tensor:
 
 
 def _apply_rope_vision(q, k, cos, sin):
+    # cos/sin arrive pre-unsqueezed fp32 (built once per forward, not per block)
     dt = q.dtype
     q, k = q.float(), k.float()
-    cos, sin = cos.unsqueeze(-2).float(), sin.unsqueeze(-2).float()
     qe = (q * cos) + (_rotate_half(q) * sin)
     ke = (k * cos) + (_rotate_half(k) * sin)
     return qe.to(dt), ke.to(dt)
@@ -79,15 +79,14 @@ class _VAttention(BaseOP):
         self._heads = vc["num_heads"]
         self._scale = (vc["hidden_size"] // vc["num_heads"]) ** -0.5
 
-    def forward(self, x, cu_seqlens, cos, sin):
+    def forward(self, x, bounds, cos, sin):
         S = x.shape[0]
         q, k, v = self.qkv.forward(x).reshape(S, 3, self._heads, -1).permute(1, 0, 2, 3).unbind(0)
         q = self.q_norm.forward(q)
         k = self.k_norm.forward(k)
         q, k = _apply_rope_vision(q, k, cos, sin)
-        # per-image full attention (cu_seqlens delimits images), exact sdpa per chunk
+        # per-image full attention (bounds delimits images), exact sdpa per chunk
         outs = []
-        bounds = cu_seqlens.tolist()
         for i in range(len(bounds) - 1):
             a, b = bounds[i], bounds[i + 1]
             qi = q[a:b].transpose(0, 1)  # [H, L, D]
@@ -119,8 +118,8 @@ class _VBlock(BaseOP):
         self.attn = _VAttention(vc)
         self.mlp = _VMLP(vc, vc["hidden_size"], vc["intermediate_size"], vc["attention_bias"])
 
-    def forward(self, x, cu_seqlens, cos, sin):
-        x = x + self.attn.forward(self.norm1.forward(x), cu_seqlens, cos, sin)
+    def forward(self, x, bounds, cos, sin):
+        x = x + self.attn.forward(self.norm1.forward(x), bounds, cos, sin)
         x = x + self.mlp.forward(self.norm2.forward(x))
         return x
 
@@ -220,15 +219,22 @@ class Glm5Vision(BaseOP):
     def forward(self, pixel_values: torch.Tensor, grid_thw: torch.Tensor) -> torch.Tensor:
         vc = self._vc
         pos = self._position_ids(grid_thw)                        # [S, 2]
-        seq = (grid_thw[:, 0] * grid_thw[:, 1] * grid_thw[:, 2])
-        cu = torch.cat([seq.new_zeros(1), seq.cumsum(0)]).to(torch.int64)
+        # Attention segments follow the qwen2_vl/glm4v convention (HF
+        # get_vision_cu_seqlens merge_temporal=False): each temporal unit is its
+        # own segment -- t segments of h*w patches per video, one for an image.
+        bounds = [0]
+        for t, h, w in grid_thw.tolist():                         # one host sync total
+            hw = h * w
+            for _ in range(int(t)):
+                bounds.append(bounds[-1] + hw)
         x = self.patch_embed.forward(pixel_values)
         inv = self._inv_freq_for(x.device)
         rot = (pos.unsqueeze(-1) * inv).flatten(1)                # [S, rd/2*2]
         emb = torch.cat((rot, rot), dim=-1)
-        cos, sin = emb.cos(), emb.sin()
+        cos = emb.cos().unsqueeze(-2).float()                     # fp32 once, all 24 blocks
+        sin = emb.sin().unsqueeze(-2).float()
         for blk in self.blocks.op_list:
-            x = blk.forward(x, cu, cos, sin)
+            x = blk.forward(x, bounds, cos, sin)
         x = self.post_layernorm.forward(x)
         m = vc["spatial_merge_size"]
         x = x.view(-1, m, m, x.shape[-1]).permute(0, 3, 1, 2)

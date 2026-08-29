@@ -1,0 +1,10 @@
+--- a/python/freetoken/server/api_models.py
++++ b/python/freetoken/server/api_models.py
+@@ -10,6 +10,7 @@
+     type: str
+     text: str | None = None
+     image_url: Any | None = None
++    video_url: Any | None = None
+     audio_url: Any | None = None
+ 
+ 

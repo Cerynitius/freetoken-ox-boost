@@ -17,7 +17,7 @@
  
          # initialize other managers
          self.table_manager = TableManager(config.max_running_req, self.engine.page_table)
-@@ -486,6 +489,43 @@
+@@ -486,6 +489,79 @@
                      "Dropping request %d because its abort arrived before admission", msg.uid
                  )
                  return
@@ -43,6 +43,42 @@
 +                        ),
 +                        torch.tensor(grids, dtype=torch.long, device=self.device),
 +                    )
++                    # Content-hash cache keys: fill each image's placeholder span with a
++                    # per-image pixel hash (negative id range). Identical prefixes with the
++                    # SAME image become prefix-cache hits; different images diverge at the
++                    # span's first token, so cross-image reuse is impossible.
++                    image_token_id = getattr(
++                        self.engine.model.config, "image_token_id", None
++                    )
++                    if image_token_id is not None:
++                        import hashlib
++
++                        key_ids = msg.input_ids.clone()
++                        pos = (key_ids == image_token_id).nonzero(as_tuple=True)[0]
++                        runs = []
++                        if pos.numel():
++                            brk = (pos[1:] - pos[:-1] > 1).nonzero(as_tuple=True)[0] + 1
++                            runs = [
++                                t
++                                for t in torch.tensor_split(pos, brk.tolist())
++                                if t.numel()
++                            ]
++                        expected = sum(d["grid"][0] for d in msg.mm_images)
++                        assert len(runs) == expected, (
++                            f"{len(runs)} image-token spans vs {expected} expected "
++                            "(one per image, grid_t per video; literal placeholder "
++                            "text in the prompt?)"
++                        )
++                        ri = 0
++                        for d in msg.mm_images:
++                            h = int.from_bytes(
++                                hashlib.blake2b(d["pix"], digest_size=8).digest(), "big"
++                            )
++                            hid = -(h % (2**31 - 2)) - 2
++                            for _ in range(d["grid"][0]):
++                                key_ids[runs[ri]] = hid
++                                ri += 1
++                        msg.cache_key_ids = key_ids
 +                    msg.mm_images = None
 +                except Exception as exc:  # noqa: BLE001 -- reply, never crash the loop
 +                    logger.warning_rank0(

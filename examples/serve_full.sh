@@ -22,6 +22,8 @@ export FREETOKEN_GLM5_KDA_FP8=${FREETOKEN_GLM5_KDA_FP8:-1}
 export FREETOKEN_MOE_SPEC_PREFETCH=${FREETOKEN_MOE_SPEC_PREFETCH:-4}
 # Vision (image input on both APIs): +~1.2 GB VRAM for the BF16 tower; needs pillow.
 export FREETOKEN_GLM5_VISION=${FREETOKEN_GLM5_VISION:-1}
+# 128 covers typical multi-turn extends after a radix prefix hit (turn-2 TTFT 2.84->1.13s)
+export FREETOKEN_PREFILL_ONDEMAND_TOKENS=${FREETOKEN_PREFILL_ONDEMAND_TOKENS:-128}
 
 MODEL=/home/zrx/glm5-stack/weights/GLM-5.3-Flash-NVFP4
 PORT="${GLM5_PORT:-1920}"
@@ -50,7 +52,7 @@ exec ft serve \
   --nvfp4-backend auto \
   --moe-cache-auto \
   --moe-prefill-hit-d2d \
-  --cache-type naive \
+  --cache-type ${GLM5_CACHE_TYPE:-radix} \
   --memory-ratio ${GLM5_MEMRATIO:-0.88} \
   --kv-reserve-tokens "$KV_RESERVE" \
   --max-seq-len-override "$CTX" \

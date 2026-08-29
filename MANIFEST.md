@@ -39,13 +39,27 @@ offload), single-stream decode unless noted.
 | Image preprocessing (vendored `Glm5NextImageProcessorPil`: smart resize -> bicubic -> pad -> CLIP normalize -> patchify; bitwise-equal pixel_values vs HF) | `overlay: models/glm5_next/image_process.py` | `pip install pillow` |
 | Server intake: OpenAI `image_url` (data URI / http) + Anthropic base64 `image` blocks -> template placeholder expansion -> pixels over the ZMQ msgpack codec -> vision encode at admission in the scheduler process | `patches: server_generation / server_openai_api / server_anthropic_api / tokenizer_tokenize / tokenizer_server / message_tokenizer / message_backend / scheduler_scheduler` | same switch |
 
+| Video input (OpenAI `video_url` parts; PyAV decode -> fps-2 sampling -> paired-frame temporal patches -> per-unit frame blocks with timestamps, HF-processor-faithful; per-unit vision attention segments) | `overlay: models/glm5_next/image_process.py (video half)` + `patches: server_generation / server_api_models / tokenizer_tokenize` | `pip install av`; `FREETOKEN_GLM5_VIDEO_FPS` (2) / `FREETOKEN_GLM5_MAX_VIDEO_TOKENS` (8000) / `FREETOKEN_GLM5_MAX_VIDEO_FRAMES` (64) |
+| Content-hash prefix cache for media requests (image spans keyed by per-image pixel blake2b in the negative id range; same media prefix hits, different media diverges at span start; covered leading spans slice the scatter rows) | `patches: scheduler_cache / scheduler_prefill / scheduler_utils / scheduler_scheduler` | active with `--cache-type radix`; offline mm path keeps the old skip |
+| Image-token budget knob | `overlay: models/glm5_next/image_process.py` | `FREETOKEN_GLM5_MAX_IMAGE_TOKENS` (8000 patches) |
+
+Measured (production box, radix + `FREETOKEN_PREFILL_ONDEMAND_TOKENS=128`):
+same-image repeat TTFT 3.8 -> 1.0 s; image-conversation turn-2 2.8 -> 1.1 s;
+long-text shared prefix 4.1 -> 1.1 s; different image never false-hits (fresh
+answer verified); needle recall correct after prefix reuse; video motion /
+start-end / colors correct on a synthetic clip. Vision overhead outside the
+cache: tower + vendored preprocessing < 20 ms for a 448px image (a 220-token
+image request matches a 220-token text prompt's TTFT); the 24-block tower runs
+one attention segment per temporal unit (t=2 parity vs HF within the bf16
+noise envelope).
+
 Validation: tower parity vs HF stage-by-stage on real weights (patch embed +
 rotary tables bitwise-equal; per-layer drift within the BF16 kernel-noise
 envelope of HF sdpa-vs-eager). End-to-end on the production server: shapes /
 colors / positions, counting, two-image comparison, text-in-image reading, on
-both APIs. Constraints: an image prompt must fit one prefill chunk; image
-requests skip prefix caching (upstream behavior); `count_tokens` does not
-account for image expansion yet.
+both APIs. Constraints: an image prompt must fit one prefill chunk;
+`count_tokens` does not account for image expansion yet; Anthropic-endpoint
+video blocks are not supported (no standard block type).
 
 ## Archived experiments (off by default; verdicts in commit history)
 
