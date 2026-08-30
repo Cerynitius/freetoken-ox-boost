@@ -43,15 +43,20 @@ The checkpoint's 0.6B ViT tower is ported and wired end to end. Images work on b
 
 Prefix caching works for media requests. Image placeholder ids are replaced by a pixel-content hash in the radix cache key, so identical text plus media prefixes hit and different images never false-hit. Repeating an image request drops TTFT from 3.8 to 1.0 s, and a follow-up turn in the same image conversation from 2.8 to 1.1 s. Under production-shaped load, multi-turn agent conversations with interleaved images hold about 1 s TTFT per turn, shared system prompts and long documents hit across conversations, and LRU eviction past the 262K pool keeps the newest entries. One known edge: a re-query landing within one decode step of an identical request can miss the not-yet-inserted prefix and pay one cold prefill.
 
-**Known issue (2026-08-30, under investigation):** on this hybrid (KDA) model,
-radix cache-HIT requests co-batched with in-flight decode corrupt ~8% of the
-time under concurrent load — blank visual grounding, empty or garbled answers,
-text and image hits alike. Cold prefill is clean, and sequential single-stream
-use showed no corruption in extended testing. The trigger is the upstream
-hybrid hit path under concurrency, not the media keying (reproduced with
-pure-text prompts; forensics confirm payloads and keys correct on every
-failure). The example default is `naive` until this is fixed; opt in with
-`GLM5_CACHE_TYPE=radix` for single-stream use.
+**Hybrid hit-corruption: found and fixed (2026-08-30).** An overnight
+ground-truth soak caught radix cache-HIT requests corrupting ~10% of the time
+when co-batched with in-flight decode (blank visual grounding, empty or
+garbled answers, text and image alike; cold path always clean). The upstream
+design donates the request's live GDN snapshot slot into the radix tree by
+ownership transfer, leaving one slot id shared between the finishing request's
+in-flight pipeline and the tree; a late write through that alias poisons every
+future hit of the branch (observed as sticky failure windows that self-heal on
+re-donation). The fix gives the tree a **private clone** of the snapshot
+(copy-on-donate — the tree slot is written once and read-only forever) plus
+full-device barriers at hit admission and donation bookkeeping. Verified:
+image hammer 0/60 (was 3/30), text hammers 48 rounds with zero corrupted
+answers, cache battery green, decode throughput unchanged. `radix` is the
+example default again.
 
 ## Layout
 
