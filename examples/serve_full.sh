@@ -52,7 +52,7 @@ exec ft serve \
   --nvfp4-backend auto \
   --moe-cache-auto \
   --moe-prefill-hit-d2d \
-  --cache-type ${GLM5_CACHE_TYPE:-naive} \
+  --cache-type ${GLM5_CACHE_TYPE:-radix} \
   --memory-ratio ${GLM5_MEMRATIO:-0.88} \
   --kv-reserve-tokens "$KV_RESERVE" \
   --max-seq-len-override "$CTX" \

@@ -1,0 +1,17 @@
+--- a/python/freetoken/kvcache/linear_state_pool.py
++++ b/python/freetoken/kvcache/linear_state_pool.py
+@@ -139,6 +139,14 @@
+         self.conv_states[:, slots] = 0
+         self.recurrent_states[:, slots] = 0
+ 
++    def debug_checksum(self, slot: int) -> float:
++        """Diagnostic-only: host-synced abs-sum of one slot's conv+recurrent state."""
++        import torch
++        torch.cuda.synchronize(self._device)
++        return float(self.conv_states[:, slot].abs().sum()) + float(
++            self.recurrent_states[:, slot].abs().sum()
++        )
++
+     def copy_from(self, src: int, dst: int) -> None:
+         """Copy a whole-sequence snapshot (conv + recurrent, all layers) from slot ``src`` to
+         ``dst``. Used for COW-on-restore (donated snapshot -> fresh live slot)."""

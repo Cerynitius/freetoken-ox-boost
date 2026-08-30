@@ -1,10 +1,28 @@
 --- a/python/freetoken/scheduler/prefill.py
 +++ b/python/freetoken/scheduler/prefill.py
-@@ -169,6 +169,14 @@
+@@ -7,6 +7,8 @@
+ from freetoken.core import Batch, Req
+ from freetoken.utils import align_down, div_ceil, init_logger
+ 
++_logger_mm = init_logger(__name__)
++
+ from .utils import PendingReq
+ 
+ if TYPE_CHECKING:
+@@ -169,6 +171,23 @@
                  "Multimodal prompts must fit in a single prefill chunk; increase "
                  "--max-extend-tokens or shrink the prompt."
              )
 +        mm_embeds = pending_req.mm_embeds
++        if mm_embeds is not None and pending_req.cache_key_ids is not None:
++            # mm-forensic: match depth for every media request (spans start where the
++            # first negative key id sits, so depth vs span position is decodable).
++            _span0 = int((pending_req.cache_key_ids < 0).nonzero()[0, 0]) if bool(
++                (pending_req.cache_key_ids < 0).any()) else -1
++            _logger_mm.info(
++                "mm-match uid=%d cached_len=%d prompt_len=%d span0=%d",
++                pending_req.uid, cached_len, len(pending_req.input_ids), _span0,
++            )
 +        if mm_embeds is not None and cached_len > 0 and pending_req.cache_key_ids is not None:
 +            # A cache hit may cover leading images (whole or partial spans -- content
 +            # hashes guarantee a matched span is the SAME image). The extend only
@@ -15,7 +33,7 @@
          req = CLS(
              input_ids=pending_req.input_ids[: cached_len + chunk_size],
              table_idx=table_idx,
-@@ -177,10 +185,11 @@
+@@ -177,10 +196,11 @@
              uid=pending_req.uid,
              cache_handle=cache_handle,
              sampling_params=pending_req.sampling_params,
@@ -28,7 +46,7 @@
          req.linear_slot_idx = linear_slot_idx
          req.mamba_ping_pong = ping_pong
          req.mamba_next_track_idx = next_track_idx
-@@ -238,7 +247,13 @@
+@@ -238,7 +258,13 @@
  
      def add_one_req(self, req: UserMsg) -> None:
          self.pending_list.append(
