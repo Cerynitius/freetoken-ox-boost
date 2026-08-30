@@ -15,7 +15,7 @@
  class CacheManager:
      def __init__(self, num_pages: int, page_size: int, page_table: torch.Tensor, type: str,
                   linear_state_pool=None, swa_pool=None, sliding_window_size=None):
-@@ -60,6 +68,12 @@
+@@ -60,7 +68,17 @@
          self.num_pages = num_pages
          self.page_table = page_table
          self.page_size = page_size
@@ -26,9 +26,14 @@
 +
 +        self.spec_horizon = int(_os.environ.get("FREETOKEN_GLM5_SPEC", "0") or 0)
          self.cache_type = type
++        # Set by the scheduler from ModelConfig.gdn_track_snapshots: models whose linear
++        # op lacks the track-snapshot writer must not allocate ping-pong slots (their
++        # frozen donates would put UNWRITTEN all-zero states into the tree).
++        self.gdn_track_snapshots = True
  
      # ----- capability hooks (defaults; plugged-in pools may narrow them) -----
-@@ -82,14 +96,36 @@
+     supports_runtime_rebuild = True
+@@ -82,14 +100,36 @@
              from freetoken.kvcache.swa_radix_cache import SWARadixCache
              return SWARadixCache(device, page_size, self.sliding_window_size)
          return create_prefix_cache(device=device, type=type, page_size=page_size)
@@ -69,7 +74,7 @@
          if self.is_swa:
              from freetoken.kvcache.swa_radix_cache import SWACacheHandle
              m = self.prefix_cache.match_prefix(ids)
-@@ -256,9 +292,18 @@
+@@ -256,9 +296,18 @@
      def allocate_paged(self, reqs: List[Req]) -> None:
          needed_pages = 0
          allocation_info: List[Tuple[int, int, int]] = []
@@ -88,7 +93,7 @@
              if last_page > first_page:
                  needed_pages += last_page - first_page
                  allocation_info.append((req.table_idx, first_page, last_page))
-@@ -292,10 +337,9 @@
+@@ -292,10 +341,9 @@
          #                                           We should free it if the request has finished.
          page_indices = self.page_table[req.table_idx, : req.cached_len]
          old_handle = req.cache_handle
@@ -102,7 +107,7 @@
              self.unlock(old_handle)
              if finished:
                  tail = self._padded_tail(req, old_handle.cached_len)
-@@ -303,7 +347,7 @@
+@@ -303,7 +351,7 @@
                      self._free_swa(tail)
                  self._free(tail)
              return
@@ -111,10 +116,11 @@
          cached_len, new_handle = self.prefix_cache.insert_prefix(insert_ids, page_indices)
          # unlock until all operations on handle is done
          self.unlock(old_handle)
-@@ -331,6 +375,20 @@
+@@ -330,6 +378,27 @@
+                     canonical[old_handle.cached_len : cached_len])
              req.cache_handle = new_handle
              self.lock(new_handle)
- 
++
 +    def _clone_slot_for_tree(self, src: int) -> int:
 +        """copy-on-donate: the tree receives a PRIVATE clone of the snapshot slot instead
 +        of taking ownership of the request's slot. Ownership transfer shares one slot id
@@ -127,12 +133,18 @@
 +        self.ensure_mamba_slots(1)
 +        dst = self.linear_state_pool.alloc(1)[0]
 +        self.linear_state_pool.copy_from(src, dst)
++        if _GDN_DEBUG:
++            _logger_gdn.info(
++                "gdn-clone src=%d dst=%d src_cksum=%.3f dst_cksum=%.3f",
++                src, dst,
++                self.linear_state_pool.debug_checksum(src),
++                self.linear_state_pool.debug_checksum(dst),
++            )
 +        return dst
-+
+ 
      def _cache_req_hybrid(self, req: Req, *, finished: bool) -> None:
          """Hybrid (GDN) cache_req: commit KV like radix AND manage the GDN state snapshot.
-         Prefill chunk commit: DONATE the frozen ping-pong slot (the snapshot the forward wrote
-@@ -339,11 +397,17 @@
+@@ -339,11 +408,17 @@
          (final full-sequence state, zero-copy since the req is done) and free the req's slots."""
          from freetoken.kvcache.hybrid_radix_cache import HybridCacheHandle
  
@@ -151,7 +163,7 @@
              self.unlock(old_handle)
              if finished:
                  self._free(page_indices[old_handle.cached_len :])
-@@ -368,9 +432,12 @@
+@@ -368,9 +443,12 @@
              ):
                  frozen_idx = 1 - req.mamba_next_track_idx
                  frozen = req.mamba_ping_pong[frozen_idx]
@@ -166,7 +178,7 @@
                  req.mamba_ping_pong = None
                  self._free(page_indices[free_upto : max(free_upto, prefix_len)])
                  free_upto = max(free_upto, L)
-@@ -382,11 +449,20 @@
+@@ -382,11 +460,20 @@
              insert_len = align_down(req.cached_len, self.page_size)
              keep_live = False
              if insert_len == req.cached_len and insert_len > 0:
@@ -189,7 +201,7 @@
              else:
                  self.unlock(old_handle)
                  self._free(page_indices[free_upto :])
-@@ -405,14 +481,22 @@
+@@ -405,14 +492,22 @@
              return
          frozen_idx = 1 - req.mamba_next_track_idx          # the slot the forward just wrote
          frozen = req.mamba_ping_pong[frozen_idx]
@@ -214,7 +226,7 @@
          # Same re-point as the generic path: the dedup free above returned this request's own
          # pages for [old_handle.cached_len, prefix_len) while its row still named them.
          if prefix_len > old_handle.cached_len:
-@@ -420,11 +504,8 @@
+@@ -420,11 +515,8 @@
                  m.kv_indices[old_handle.cached_len : prefix_len])
          req.cache_handle = HybridCacheHandle(m.cached_len, m.node, m.kv_indices)
          self.lock(req.cache_handle)
@@ -228,7 +240,7 @@
          req.mamba_last_track_seqlen = None
  
      def _cache_req_swa(self, req: Req, *, finished: bool) -> None:
-@@ -437,7 +518,7 @@
+@@ -437,7 +529,7 @@
          old_handle = req.cache_handle
          page_indices = self.page_table[req.table_idx, : req.cached_len]
  
@@ -237,7 +249,7 @@
              self.unlock(old_handle)
              if finished:
                  tail = self._padded_tail(req, old_handle.cached_len)
-@@ -457,7 +538,7 @@
+@@ -457,7 +549,7 @@
              # unfinished chunk's frontier is already > 0 and must be honored (else insert adopts
              # sentinel slots -> the request's later SWA gathers read slot 0 -> corruption).
              _, freed = self.prefix_cache.insert(
@@ -246,7 +258,7 @@
                  swa_evicted_seqlen=req.swa_evicted_seqlen,
                  update_kv_after_len=old_handle.cached_len)
          self.unlock(old_handle)
-@@ -485,8 +566,8 @@
+@@ -485,8 +577,8 @@
                  )
                  if keep_from > 0:
                      self._free_swa(
@@ -257,7 +269,7 @@
          else:
              # inc_lock is node-granular, and the suffix insert just made this chunk's whole
              # extend one node: locking it would pin the entire chunk's swa for all of decode,
-@@ -497,8 +578,8 @@
+@@ -497,8 +589,8 @@
              keep_from = align_down(
                  max(insert_len - self.sliding_window_size - _SWA_RETAIN_GAP, 0), self.page_size)
              if keep_from > 0:
@@ -268,7 +280,7 @@
              # Re-point the page table to the tree's live slots for the committed region. Any dup
              # slots insert reclaimed had their full->swa mapping reset to the 0 sentinel; unlike the
              # full pool (KV survives in place until realloc), a stale swa mapping would make the
-@@ -516,6 +597,8 @@
+@@ -516,6 +608,8 @@
          to the finishing request. ``start`` is page-aligned (a match/insert boundary), so the
          full-pool page bases derived via ``[::page_size]`` are identical to the unpadded slice."""
          end = div_ceil(req.cached_len, self.page_size) * self.page_size

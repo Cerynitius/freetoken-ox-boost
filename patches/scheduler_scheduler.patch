@@ -17,7 +17,21 @@
  
          # initialize other managers
          self.table_manager = TableManager(config.max_running_req, self.engine.page_table)
-@@ -486,6 +489,106 @@
+@@ -83,6 +86,13 @@
+                 (g.sliding_window for g in config.model_config.kv_cache_group_specs() if g.is_swa),
+                 None,
+             ) or getattr(self.engine.kv_cache, "sliding_window_size", None),
++        )
++        # KDA (glm5_next) has no track-snapshot writer yet: without this gate its frozen
++        # ping-pong donates would put UNWRITTEN all-zero states into the radix tree and
++        # every prefix hit would restore zero recurrent state (full-attention layers then
++        # carry the prefix alone -- usually survivable, intermittently wrong).
++        self.cache_manager.gdn_track_snapshots = getattr(
++            config.model_config, "gdn_track_snapshots", True
+         )
+         self.decode_manager = DecodeManager(config.page_size)
+         self.prefill_manager = PrefillManager(
+@@ -486,6 +496,106 @@
                      "Dropping request %d because its abort arrived before admission", msg.uid
                  )
                  return
@@ -124,7 +138,7 @@
              input_len, max_seq_len = len(msg.input_ids), self.engine.max_seq_len
              max_output_len = max_seq_len - input_len
              if max_output_len <= 0:
-@@ -586,8 +689,28 @@
+@@ -586,8 +696,28 @@
          pool = self.engine.linear_state_pool
          if pool is None or not batch.is_prefill:
              return

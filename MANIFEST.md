@@ -52,6 +52,13 @@ zero integrity failures. Known edge: an identical-prefix re-query inside the
 one-decode-step window between match and the previous request's finish-insert
 pays one cold prefill (rare, benign).
 
+KDA track-snapshot writer + hybrid-cache hardening (2026-08-30): the missing
+×64-boundary snapshot write for KDA (`overlay: models/glm5_next/attention.py`,
+recompute-based), `gdn_track_snapshots` model flag (`patches: models_config /
+scheduler_scheduler / scheduler_cache / scheduler_prefill / attention_linear`),
+snapshot copy-on-donate + admission/donate barriers, and env-gated GDN
+checksum forensics (`FREETOKEN_GDN_DEBUG`, `pool.debug_checksum`).
+
 Measured (production box, radix + `FREETOKEN_PREFILL_ONDEMAND_TOKENS=128`):
 same-image repeat TTFT 3.8 -> 1.0 s; image-conversation turn-2 2.8 -> 1.1 s;
 long-text shared prefix 4.1 -> 1.1 s; different image never false-hits (fresh

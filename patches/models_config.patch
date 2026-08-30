@@ -1,6 +1,19 @@
 --- a/python/freetoken/models/config.py
 +++ b/python/freetoken/models/config.py
-@@ -288,6 +288,8 @@
+@@ -268,6 +268,12 @@
+     # (muse_glimmer: 1/sqrt(hidden/256)); None leaves the logits unscaled.
+     output_multiplier: float | None = None
+     vision_config: Any | None = None
++    # Whether this model's linear-attention op implements the ×64-boundary track-snapshot
++    # write (_write_track_snapshot). Models that DON'T must not build track metadata:
++    # the frozen ping-pong slots would be donated to the radix tree UNWRITTEN, and every
++    # prefix hit would COW-restore an all-zero recurrent state (the model then runs on
++    # full-attention layers alone -- usually survivable, intermittently wrong).
++    gdn_track_snapshots: bool = True
+     image_token_id: int | None = None
+     attention_groups: Tuple[AttentionGroupConfig, ...] = ()
+     has_attn_bias: bool = False
+@@ -288,6 +294,8 @@
      # swigluoai/dense-MLP scalars the model module needs. Opaque to model-agnostic engine
      # code; None for every other model.
      m3_args: Any | None = None
@@ -9,7 +22,7 @@
      # Generic execution-path capability flags (set by a model's parse_config) so the engine and
      # factories stay model-agnostic instead of branching on dsv4_args:
      single_stream_only: bool = False  # model runs one sequence at a time -> force bs=1
-@@ -298,12 +300,22 @@
+@@ -298,12 +306,22 @@
  
      @property
      def num_moe_layers(self) -> int:

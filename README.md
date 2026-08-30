@@ -43,20 +43,26 @@ The checkpoint's 0.6B ViT tower is ported and wired end to end. Images work on b
 
 Prefix caching works for media requests. Image placeholder ids are replaced by a pixel-content hash in the radix cache key, so identical text plus media prefixes hit and different images never false-hit. Repeating an image request drops TTFT from 3.8 to 1.0 s, and a follow-up turn in the same image conversation from 2.8 to 1.1 s. Under production-shaped load, multi-turn agent conversations with interleaved images hold about 1 s TTFT per turn, shared system prompts and long documents hit across conversations, and LRU eviction past the 262K pool keeps the newest entries. One known edge: a re-query landing within one decode step of an identical request can miss the not-yet-inserted prefix and pay one cold prefill.
 
-**Hybrid hit-corruption: found and fixed (2026-08-30).** An overnight
-ground-truth soak caught radix cache-HIT requests corrupting ~10% of the time
-when co-batched with in-flight decode (blank visual grounding, empty or
-garbled answers, text and image alike; cold path always clean). The upstream
-design donates the request's live GDN snapshot slot into the radix tree by
-ownership transfer, leaving one slot id shared between the finishing request's
-in-flight pipeline and the tree; a late write through that alias poisons every
-future hit of the branch (observed as sticky failure windows that self-heal on
-re-donation). The fix gives the tree a **private clone** of the snapshot
-(copy-on-donate — the tree slot is written once and read-only forever) plus
-full-device barriers at hit admission and donation bookkeeping. Verified:
-image hammer 0/60 (was 3/30), text hammers 48 rounds with zero corrupted
-answers, cache battery green, decode throughput unchanged. `radix` is the
-example default again.
+**Hybrid hit-corruption: found, root-caused, and fixed (2026-08-30).** An
+overnight ground-truth soak caught radix cache-HIT requests corrupting ~10% of
+the time (blank visual grounding, empty or garbled answers, text and image
+alike; cold path always clean; sticky per-branch failure windows). Slot-level
+checksum forensics delivered the true root cause: the KDA op never implemented
+the ×64-boundary track-snapshot write that the hybrid-radix design expects
+(`_write_track_snapshot` exists only in the Qwen GDN op), so every donated
+reuse point carried an UNWRITTEN all-zero recurrent state — hits then ran the
+prefix on the 11 full-attention layers alone, which usually survives and
+intermittently derails. The fix implements the missing writer for KDA
+(recompute-based: `chunk_kda` only exposes the final state, so each tracked
+request's pre-boundary slice is re-run from its pre-forward state and banked;
+the main path stays bit-identical), plus defense-in-depth from the
+investigation: snapshot copy-on-donate (tree slots are written once and
+read-only forever), full-device barriers at hit admission and donation, and a
+`gdn_track_snapshots` gate so a model without a writer can never donate
+unwritten state again. Verified: restore-side checksums show real boundary
+state on every hit (zero-state restores eliminated), 90-round hammer clean,
+same-image repeat 0.85 s / turn-2 0.99 s / long-document follow-up 1.35 s with
+correct answers throughout. `radix` is the example default.
 
 ## Layout
 

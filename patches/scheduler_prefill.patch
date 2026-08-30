@@ -9,7 +9,17 @@
  from .utils import PendingReq
  
  if TYPE_CHECKING:
-@@ -169,6 +171,23 @@
+@@ -106,7 +108,8 @@
+         if self.cache_manager.is_hybrid:
+             pool = self.cache_manager.linear_state_pool
+             linear_slot_idx = pool.alloc(1)[0]
+-            ping_pong = tuple(pool.alloc(2))
++            if getattr(self.cache_manager, "gdn_track_snapshots", True):
++                ping_pong = tuple(pool.alloc(2))
+ 
+         return handle, table_idx, linear_slot_idx, ping_pong, mr.mamba_value
+ 
+@@ -169,6 +172,23 @@
                  "Multimodal prompts must fit in a single prefill chunk; increase "
                  "--max-extend-tokens or shrink the prompt."
              )
@@ -33,7 +43,7 @@
          req = CLS(
              input_ids=pending_req.input_ids[: cached_len + chunk_size],
              table_idx=table_idx,
-@@ -177,10 +196,11 @@
+@@ -177,10 +197,11 @@
              uid=pending_req.uid,
              cache_handle=cache_handle,
              sampling_params=pending_req.sampling_params,
@@ -46,7 +56,7 @@
          req.linear_slot_idx = linear_slot_idx
          req.mamba_ping_pong = ping_pong
          req.mamba_next_track_idx = next_track_idx
-@@ -238,7 +258,13 @@
+@@ -238,7 +259,13 @@
  
      def add_one_req(self, req: UserMsg) -> None:
          self.pending_list.append(

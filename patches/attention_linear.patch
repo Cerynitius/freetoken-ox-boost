@@ -1,0 +1,84 @@
+--- a/python/freetoken/attention/linear.py
++++ b/python/freetoken/attention/linear.py
+@@ -41,6 +41,13 @@
+     track_dst: torch.Tensor | None = None        # [nt] int64 dst pool slot per tracked req
+     track_h_row: torch.Tensor | None = None      # [nt] int64 row into h (boh_i + aligned//CHUNK)
+     track_conv_src: torch.Tensor | None = None   # [nt, kernel-1] int64 conv-input token positions
++    # Recompute-based writer (ops without per-chunk h, e.g. KDA over external fla): flat
++    # row indices of every tracked request's pre-boundary extend slice, packed; the
++    # matching cu_seqlens; and each tracked request's position in the batch's seq order
++    # (to gather its pre-forward initial state).
++    track_gather: torch.Tensor | None = None     # [sum prefix lens] int64
++    track_cu: torch.Tensor | None = None         # [nt+1] int32
++    track_seq_idx: torch.Tensor | None = None    # [nt] int64
+ 
+ 
+ def build_fla_metadata(batch: "Batch", device: torch.device) -> FLAMetadata:
+@@ -75,9 +82,21 @@
+     idx_host = torch.tensor([gdn_slot(r) for r in reqs], dtype=torch.int32, **pin)
+     has_init_host = torch.tensor([r.cached_len > 0 for r in reqs], dtype=torch.bool, **pin)
+     fresh = [gdn_slot(r) for r in reqs if r.cached_len == 0]
++    import os as _os
++
++    if _os.getenv("FREETOKEN_GDN_DEBUG", "0") != "0":
++        from freetoken.utils import init_logger as _il
++
++        _il(__name__).info(
++            "gdn-slots prefill uids=%s slots=%s fresh=%s",
++            [getattr(r, "uid", -1) for r in reqs],
++            [gdn_slot(r) for r in reqs],
++            fresh,
++        )
+     fresh_host = torch.tensor(fresh, dtype=torch.int64, **pin) if fresh else None
+ 
+-    track_dst, track_h_row, track_conv_src = _build_track_metadata(reqs, cu_host, device, pin)
++    (track_dst, track_h_row, track_conv_src,
++     track_gather, track_cu, track_seq_idx) = _build_track_metadata(reqs, cu_host, device, pin)
+ 
+     return FLAMetadata(
+         cu_seqlens=cu_host.to(device, non_blocking=True),
+@@ -87,6 +106,7 @@
+             fresh_host.to(device, non_blocking=True) if fresh_host is not None else None
+         ),
+         track_dst=track_dst, track_h_row=track_h_row, track_conv_src=track_conv_src,
++        track_gather=track_gather, track_cu=track_cu, track_seq_idx=track_seq_idx,
+     )
+ 
+ 
+@@ -96,7 +116,7 @@
+     ping-pong slot. Returns (track_dst, track_h_row, track_conv_src) device int64 tensors, or
+     (None, None, None) when no request tracks (non-hybrid, or all extends < CHUNK+1)."""
+     if not any(r.mamba_ping_pong is not None for r in reqs):
+-        return None, None, None
++        return (None,) * 6
+     from freetoken.core import get_global_ctx
+     from freetoken.kernel.fla.chunk import CHUNK_SIZE
+     from freetoken.kernel.fla.index import prepare_chunk_offsets
+@@ -104,6 +124,7 @@
+     km1 = get_global_ctx().linear_state_pool.conv_states.shape[-1]  # conv_kernel_dim - 1
+     boh = prepare_chunk_offsets(cu_host, CHUNK_SIZE).tolist()
+     dst, h_row, conv_src = [], [], []
++    gather, cu_t, seq_idx = [], [0], []
+     for i, r in enumerate(reqs):
+         if r.mamba_ping_pong is None:
+             continue
+@@ -117,13 +138,17 @@
+         dst.append(r.mamba_ping_pong[r.mamba_next_track_idx])
+         h_row.append(boh[i] + c)
+         conv_src.append([off + c * CHUNK_SIZE - km1 + j for j in range(km1)])
++        gather.extend(range(off, off + c * CHUNK_SIZE))
++        cu_t.append(cu_t[-1] + c * CHUNK_SIZE)
++        seq_idx.append(i)
+         r.mamba_last_track_seqlen = boundary
+         r.mamba_next_track_idx = 1 - r.mamba_next_track_idx
+     if not dst:
+-        return None, None, None
++        return (None,) * 6
+     to = lambda xs, **kw: torch.tensor(xs, **pin, **kw).to(device, non_blocking=True)
+     return (to(dst, dtype=torch.int64), to(h_row, dtype=torch.int64),
+-            to(conv_src, dtype=torch.int64))
++            to(conv_src, dtype=torch.int64), to(gather, dtype=torch.int64),
++            to(cu_t, dtype=torch.int32), to(seq_idx, dtype=torch.int64))
+ 
+ 
+ __all__ = ["FLAMetadata", "build_fla_metadata"]

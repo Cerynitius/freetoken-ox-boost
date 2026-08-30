@@ -285,10 +285,34 @@ class KdaAttention(BaseOP):
             k = kf.reshape(1, total, self.num_heads, self.head_dim).to(dtype)
             v = vf.reshape(1, total, self.num_heads, self.head_dim).to(dtype)
             state = rec.index_select(0, idx_l)
+            gv = g.view(1, total, self.num_heads, self.head_dim)
+            bv = beta.view(1, total, self.num_heads)
+            if fla_md.track_dst is not None:
+                # track-snapshot write (hybrid-radix reuse points): chunk_kda only exposes
+                # the FINAL state, so recompute each tracked request's pre-boundary slice
+                # from its pre-forward initial state and bank state@boundary into the
+                # ping-pong slot. Runs BEFORE the main call's scatter; the main path stays
+                # bit-identical. KDA cost is a sliver of the MoE forward, so the extra
+                # prefix pass is noise. Conv state = the last (kernel-1) RAW conv inputs
+                # ending at the boundary (same convention as the GDN writer).
+                gi = fla_md.track_gather
+                ps = state.index_select(0, fla_md.track_seq_idx)
+                _, bstate = chunk_kda(
+                    q=q[:, gi], k=k[:, gi], v=v[:, gi],
+                    g=gv[:, gi], beta=bv[:, gi],
+                    scale=self.head_dim ** -0.5,
+                    initial_state=ps, output_final_state=True,
+                    use_qk_l2norm_in_kernel=True,
+                    cu_seqlens=fla_md.track_cu,
+                )
+                rec.index_copy_(0, fla_md.track_dst, bstate.to(rec.dtype))
+                cv = pool.conv_states[li]
+                conv_win = conv_in[fla_md.track_conv_src].transpose(-1, -2).contiguous()
+                cv.index_copy_(0, fla_md.track_dst, conv_win.to(cv.dtype))
             core, state = chunk_kda(
                 q=q, k=k, v=v,
-                g=g.view(1, total, self.num_heads, self.head_dim),
-                beta=beta.view(1, total, self.num_heads),
+                g=gv,
+                beta=bv,
                 scale=self.head_dim ** -0.5,
                 initial_state=state, output_final_state=True,
                 use_qk_l2norm_in_kernel=True,

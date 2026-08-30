@@ -185,6 +185,9 @@ def parse_config(hf_config: Any) -> ModelConfig:
         attn_quant="fp8_pertensor" if _ATTN_FP8 else "none",
         dense_quant="fp8_pertensor" if _MLP_FP8 else "none",
         lm_head_quant="fp8_pertensor" if _LMHEAD_FP8 else "none",
+        # KDA implements the recompute-based track-snapshot write (attention.py):
+        # ×64 mid-prefill reuse points carry true boundary state.
+        gdn_track_snapshots=True,
         glm_dsa_args=dsa_args,
         glm5_args=a,
     )
