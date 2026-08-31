@@ -20,7 +20,10 @@ export FREETOKEN_GLM5_KDA_FP8=${FREETOKEN_GLM5_KDA_FP8:-1}
 # Speculative expert prefetch (P=4 hop-1 no-wait): +8%% single-stream, conc-neutral,
 # zero quality risk (pure cache warming); sweep 2026-08-28: P=2/4/6/8 -> 22.6/22.9/22.4/20.1
 export FREETOKEN_MOE_SPEC_PREFETCH=${FREETOKEN_MOE_SPEC_PREFETCH:-4}
-# Vision (image input on both APIs): +~1.2 GB VRAM for the BF16 tower; needs pillow.
+# Vision (image input, both APIs): BF16 tower ~1.2G VRAM; e2e verified 2026-08-29
+# 2026-08-30: the radix hit-corruption is FIXED (GDN snapshot copy-on-donate +
+# admission/donate barriers in scheduler/cache); hammers 0/60 img + 48 rounds text
+# clean. radix is the default again.
 export FREETOKEN_GLM5_VISION=${FREETOKEN_GLM5_VISION:-1}
 # 128 covers typical multi-turn extends after a radix prefix hit (turn-2 TTFT 2.84->1.13s)
 export FREETOKEN_PREFILL_ONDEMAND_TOKENS=${FREETOKEN_PREFILL_ONDEMAND_TOKENS:-128}
@@ -43,7 +46,7 @@ echo "preflight ok: MemAvailable ${AVAIL}G; cold load ~17G dense + 31G resident 
 
 exec ft serve \
   --model "$MODEL" \
-  --served-model-name glm5-flash \
+  --served-model-name ${GLM5_NAME:-glm5-flash} \
   --host 0.0.0.0 --port "$PORT" \
   --moe-backend ${GLM5_MOE_BACKEND:-offload} \
   --moe-cpu-threads ${GLM5_CPU_THREADS:-0} \
@@ -56,5 +59,5 @@ exec ft serve \
   --memory-ratio ${GLM5_MEMRATIO:-0.88} \
   --kv-reserve-tokens "$KV_RESERVE" \
   --max-seq-len-override "$CTX" \
-  --max-running-requests 8 \
+  --max-running-requests ${GLM5_MAX_RUNNING:-2} \
   --sampling-defaults model

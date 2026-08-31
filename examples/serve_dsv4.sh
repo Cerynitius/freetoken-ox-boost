@@ -62,7 +62,7 @@ export FREETOKEN_DSV4_WOA_FP8=${FREETOKEN_DSV4_WOA_FP8:-1}
 export FREETOKEN_DSV4_HEAD_FP8=${FREETOKEN_DSV4_HEAD_FP8:-1}
 
 MODEL=/home/zrx/dsv4-stack/weights/DSV4-Flash-0731-CRACK
-PORT="${DSV4_PORT:-1919}"
+PORT="${DSV4_PORT:-1920}"
 CTX=98304
 
 # ---- preconditions: FreeToken has no guard for any of these and fails late/opaquely ----
@@ -92,7 +92,7 @@ export FREETOKEN_PREFILL_ONDEMAND_TOKENS=${FREETOKEN_PREFILL_ONDEMAND_TOKENS:-51
 (
   for _i in $(seq 1 90); do
     sleep 10
-    curl -s -m 8 "http://127.0.0.1:${DSV4_PORT:-1919}/v1/chat/completions" \
+    curl -s -m 8 "http://127.0.0.1:${DSV4_PORT:-1920}/v1/chat/completions" \
       -H "Content-Type: application/json" \
       -d "{\"model\":\"${DSV4_NAME:-dsv4-flash}\",\"messages\":[{\"role\":\"user\",\"content\":\"warmup\"}],\"max_tokens\":2}" \
       | grep -q choices && break
