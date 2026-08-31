@@ -94,8 +94,26 @@
  
      def prefill_batched(
          self, input_ids: torch.Tensor, segments, flat_positions: torch.Tensor,
-@@ -178,6 +195,10 @@
+@@ -174,10 +191,27 @@
+         # final token -> its next-token logits row.
+         h = self.embed(input_ids)
+         h = h.unsqueeze(2).repeat(1, 1, self.hc_mult, 1)
+-        for layer in self.layers:
++        tg = getattr(self, "_spec_targets", None)
++        parts = [] if tg is not None else None
++        for li, layer in enumerate(self.layers):
              h = layer.prefill_batched(h, input_ids, segments, flat_positions)
++            if parts is not None and li in tg:
++                parts.append(h[0].mean(dim=1))  # [T, dim] hc-mean at a target layer
++        if parts is not None:
++            _b = get_global_ctx().batch
++            _flat = torch.cat(parts, dim=-1)  # [T, n_targets * dim]
++            _hd = {}
++            for _i, (_off, _n, _ti, _start) in enumerate(segments):
++                _lo = max(0, _n - 128)  # the rings hold at most the trailing window
++                _hd[_i] = (flat_positions[_off + _lo: _off + _n],
++                           _flat[_off + _lo: _off + _n].clone())
++            _b.spec_hiddens = _hd
          h = self.hc_head(h)
          h = self.norm(h)
 +        if self._head_fp8:
@@ -105,16 +123,22 @@
          return F.linear(h[0, last_indices], self.head)  # [B, vocab]
  
      def decode(
-@@ -202,10 +223,17 @@
+@@ -202,10 +236,22 @@
          # into every layer. They read only the shared snapshot / positions, so they are identical
          # across layers.
          wctx = get_global_ctx().batch.attn_metadata.window_ctx(pos, rows)
+-        for layer in self.layers:
+-            h = layer.decode_step(h, pos, rows, cmp_stage_cap, input_ids, wctx)
 +        # Layer-invariant decode memo (freqs gathers, pos arithmetic): fresh per step,
 +        # first layer fills, the other 42 reuse. See ops.dctx_get.
 +        dctx = {}
-         for layer in self.layers:
--            h = layer.decode_step(h, pos, rows, cmp_stage_cap, input_ids, wctx)
++        tg = getattr(self, "_spec_targets", None)
++        for li, layer in enumerate(self.layers):
 +            h = layer.decode_step(h, pos, rows, cmp_stage_cap, input_ids, wctx, dctx)
++            if tg is not None and li in tg:
++                j = tg.index(li)
++                self.spec_hidden_decode[:B, j * self.args.dim:(j + 1) * self.args.dim].copy_(
++                    h.mean(dim=2)[:, 0])
          h = self.hc_head(h)
          h = self.norm(h)
 +        if self._head_fp8:
@@ -124,3 +148,14 @@
          return F.linear(h[:, -1], self.head)
  
  
+@@ -260,6 +306,10 @@
+         if state_dict and not _internal:
+             raise RuntimeError(f"Unexpected keys in state_dict: {list(state_dict.keys())}")
+         self._transformer.load_state_dict(casted, assign=True, strict=False)
++        import os as _os
++        if _os.environ.get("FREETOKEN_DSV4_SPEC", "0") == "1":
++            from .dspark_load import load_dspark
++            load_dspark(self._transformer, _os.environ["FREETOKEN_DSV4_SPEC_CKPT"])
+ 
+     def forward(self) -> torch.Tensor:
+         self._ensure_bound()

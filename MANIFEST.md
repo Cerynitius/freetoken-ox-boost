@@ -98,3 +98,37 @@ kernel_triton_{e4m3_compat,sampling} / models_deepseek_v4_moe / scheduler_schedu
 multi-GPU selection (--gpu UUID), host-bank pin classes (WSL/WDDM), per-GPU bench
 profiles, assorted device-index fixes. engine.py imports gpu_select at module
 level, so this group must ship with the rest.
+
+## DeepSeek-V4-Flash (DSV4) line
+
+Serving DSV4-Flash (ds_fp4 experts, 43 layers, DSA compressor/indexer, mHC) on the
+same box. Baseline after the round-2 kernels: 55 tok/s single-stream, conc8 164 tok/s
+aggregate (moe-cache-auto = 6000 experts resident, ~75 GB).
+
+| Item | Measured | Files | Switch |
+|---|---|---|---|
+| Native-FP8 wo_a grouped GEMV (M<=16 single launch) + FP8 lm_head + fused act-quant GEMV | single 51.2 -> 55.0, conc2 +7% | `patches: kernel_triton_dsv4_fp8_linear / models_deepseek_v4_{attention,model,weight}` | `FREETOKEN_DSV4_WOA_FP8` / `HEAD_FP8` (1) |
+| Short-extend on-demand prefill threshold 48 -> 512 | cold 60-500-token TTFT 1.7 s -> 0.5-0.8 s; warm long-prompt extends 0.73-0.8 s; quality 15/15 | `patches: layers_moe` (threshold) + `examples/serve_dsv4.sh` | `FREETOKEN_PREFILL_ONDEMAND_TOKENS` (512) |
+| e8m0 scale-slab index_copy fix (on-demand prefill hit path crashed the engine for any extend > threshold) | correctness fix | `patches: layers_moe` | none |
+| spec_alloc_len comfort gate in tokens (page_size-aware; was permanently 0 horizon on 128-token pages) | correctness fix for any spec on paged models | `patches: scheduler_cache` | none |
+
+### DSpark speculative decoding (built, verified, ARCHIVED -- net-negative on offload)
+
+Full port of the checkpoint's 3-stage DSpark MTP head (block-parallel 5-token draft,
+markov logit bias, confidence head, per-stage 128-slot main_kv rings): weights loaded
+to VRAM (10.3 GB carved from the expert cache by moe-cache-auto), draft runs zero-PCIe;
+verify = k+1 staggered co-tenant single-token decode rows with the compressor carry
+chained through registers (fused ratio-4 Triton chain + vectorized ratio-128 path),
+captured as a standalone CUDA graph; rollback = ring-carry archive/restore + re-chain
+over the accepted prefix (all pool writes are position-addressed, junk is
+overwritten-before-attended).
+
+Measured: 3.68 tok/round accepted (33% of rounds take all 5 drafts) -- the draft head
+is excellent. Net throughput NEGATIVE: ~42 tok/s vs 55 baseline. Two compounding
+costs: the 10.3 GB cache carve alone drops the spec-off baseline to 43.3, and the
+6-row verify pays non-amortizing PCIe expert fetches (63 ms vs 18 ms single-row).
+Same verdict class as the GLM MTP attempt (-13%). Kept env-gated OFF.
+
+| Files | Switch |
+|---|---|
+| `overlay: models/deepseek_v4/{dspark,spec,dspark_load}.py`, `kernel/triton/dsv4/spec_chain.py`; `patches: models_deepseek_v4_{model,attention,compress} / engine_engine / scheduler_cache` | `FREETOKEN_DSV4_SPEC` (0) + `FREETOKEN_DSV4_SPEC_CKPT` (checkpoint dir); diagnostics: `FREETOKEN_DSV4_SPEC_LOG`, `FREETOKEN_DSV4_SPEC_EAGER`, `FREETOKEN_DSV4_SPEC_CONF` |

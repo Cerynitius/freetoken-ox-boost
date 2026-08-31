@@ -9,8 +9,84 @@
  
  
  class Compressor(nn.Module):
-@@ -293,7 +293,7 @@
+@@ -291,9 +291,83 @@
+         )
+         return reduced
  
++    def spec_decode_chain(self, x, pos, prev_window_slots, window_slots, rows) -> None:
++        """decode_step for B co-tenant rows at CONSECUTIVE positions (spec verify):
++        identical per-position math, carry chained through registers. Tensor-addressed
++        throughout (no host ints) -> CUDA-graph safe; the python loop just unrolls."""
++        B = x.size(0)
++        ratio, d, rd = self.compress_ratio, self.head_dim, self.rope_head_dim
++        item = self.item_size
++        dtype = x.dtype
++        x = x.view(B, -1)
++        w2 = getattr(self, "_kvgate_w", None)
++        if w2 is None:
++            w2 = self._kvgate_w = torch.cat([self.wkv.weight, self.wgate.weight], 0).contiguous()
++        kvs = bf16_linear_fp32(x, w2)
++        kv_all = kvs[:, :item].contiguous()
++        idx_mod = pos % ratio
++        score_all = (kvs[:, item:] + self.ape.index_select(0, idx_mod)).contiguous()
++        should_all = ((pos + 1) % ratio == 0)
++        seed = self.attn.read_carry_blocks(  # [1, rs, 2*item] -- row 0's carry-in
++            self.layer_id, self.tier, prev_window_slots[:1], self.ring_size
++        )[0]
++        if self.overlap:
++            # one fused launch: in-SRAM 8-slot register chain over all B positions
++            from freetoken.kernel.triton.dsv4.spec_chain import chain4
++
++            pooled, states = chain4(kv_all, score_all, seed, idx_mod, should_all)
++            compressed = pooled.to(dtype).unsqueeze(1)          # [B, 1, d]
++        else:
++            # ratio-128: B consecutive positions hit DISTINCT slots, so row i's
++            # register = seed + writes of positions <= i (cumulative scatter).
++            ks = seed[:, :item].unsqueeze(0).expand(B, -1, -1).clone()
++            ss = seed[:, item:].unsqueeze(0).expand(B, -1, -1).clone()
++            for i in range(B):
++                idx = idx_mod[i].view(1, 1, 1).expand(B - i, 1, item)
++                ks[i:].scatter_(1, idx, kv_all[i].view(1, 1, item).expand(B - i, 1, item))
++                ss[i:].scatter_(1, idx, score_all[i].view(1, 1, item).expand(B - i, 1, item))
++            compressed = gated_pool(ks, ss, dtype)               # [B, 1, d]
++            states = torch.cat([ks, ss], dim=-1)                 # [B, rs, 2*item]
++        # position-ordered per-page persistence (last writer per page == its newest
++        # position, exactly what sequential decode steps leave behind)
++        for i in range(B):
++            self.attn.write_carry_blocks(
++                self.layer_id, self.tier, window_slots[i:i + 1], self.ring_size,
++                states[i:i + 1])
++        compressed = compressed.view(B, -1)
++        compressed = self.norm(compressed)
++        freqs_t = self.freqs_cis.index_select(0, (pos + 1 - ratio).clamp_min(0))
++        apply_rotary_emb_decode(compressed[..., -rd:], freqs_t)
++        if self.rotate:
++            compressed = hadamard_transform(compressed)
++            fp4_act_quant_inplace(compressed, 32)
++        else:
++            act_quant_fp8_inplace(compressed[..., :-rd], 64)
++        cmp_dst = self.attn.decode_compress_rows(
++            rows, pos, ratio, self.layer_id, self.tier, should_all
++        )
++        self.attn.scatter_compressed(self.layer_id, self.tier, cmp_dst, compressed)
++
++    def spec_advance(self, x, start_pos: int, ti: int) -> None:
++        """Sequential register advance from an ARBITRARY position (spec verify / carry
++        fix). ``extend`` tiles blocks from start_pos and so requires 128-alignment; this
++        drives the decode_step math one position at a time off the LIVE slot maps -- by
++        construction each position gets exactly the treatment a normal decode step would
++        have given it. n is tiny (<= draft block + 1), so the python loop is fine."""
++        n = x.size(1)
++        dev = x.device
++        rows0 = torch.zeros(1, dtype=torch.int64, device=dev)
++        for i in range(n):
++            q = start_pos + i
++            pw = self.attn.window_slots_of(ti, q - 1, q)
++            cw = self.attn.window_slots_of(ti, q, q + 1)
++            self.decode_step(
++                x[:, i], torch.tensor([q], device=dev), pw, cw, rows0, None
++            )
++
      def decode_step(
          self, x: torch.Tensor, pos: torch.Tensor, prev_window_slots: torch.Tensor,
 -        window_slots: torch.Tensor, rows: torch.Tensor,
@@ -18,7 +94,15 @@
      ) -> None:
          """Batched single-token compressor update (EAGER/graph; ``pos``/``prev_window_slots``/
          ``window_slots`` are GPU int tensors ``[B]``; ``rows`` is the LOCAL row index [B] into the
-@@ -310,11 +310,18 @@
+@@ -306,15 +380,26 @@
+         -> disjoint ring blocks, so co-tenant rows never contaminate each other."""
+         assert self.cmp_pool is not None
+         B = x.size(0)
++        if B > 1 and getattr(get_global_ctx().batch, "spec_verify", False):
++            # Spec verify: co-tenant staggered rows share ring pages; parallel carry
++            # read/write would be stale/racy. Chain the registers instead.
++            return self.spec_decode_chain(x, pos, prev_window_slots, window_slots, rows)
+         ratio, overlap, d, rd = self.compress_ratio, self.overlap, self.head_dim, self.rope_head_dim
          dtype = x.dtype
          item = self.item_size  # the ring's kv|score split point
          x = x.view(B, -1)
@@ -41,7 +125,35 @@
  
          # Read each row's rolling carry block from the PREVIOUS token's page (ks|ss split at item).
          block = self.attn.read_carry_blocks(  # [B, ring_size, 2*item]
-@@ -449,7 +456,7 @@
+@@ -425,10 +510,13 @@
+             topk=self.index_topk, offset=offset,
+         )
+ 
+-    def extend(self, x, qr, start_pos, offset, window_slots, tail_window_slot, ti: int = 0):
++    def extend(self, x, qr, start_pos, offset, window_slots, tail_window_slot, ti: int = 0,
++               spec: bool = False):
+         """Carry-aware indexer for re-prefill new tokens [start_pos, end). Runs the indexer's
+         compressor extend (writes new idx blocks), scores each new query over compressed indexer
+-        blocks [0, end//ratio) with a causal mask, returns top-k block indices offset by ``offset``."""
++        blocks [0, end//ratio) with a causal mask, returns top-k block indices offset by ``offset``.
++        ``spec``: arbitrary (mid-page) start -- the compressor advances per position instead of
++        through the 128-aligned block-tiled extend."""
+         bsz, seqlen, _ = x.size()
+         end = start_pos + seqlen
+         freqs_cis = self.freqs_cis[start_pos:end]
+@@ -437,7 +525,10 @@
+         apply_rotary_emb(q[..., -rd:], freqs_cis)
+         q = hadamard_transform(q)
+         fp4_act_quant_inplace(q, 32)
+-        self.compressor(x, start_pos, window_slots, tail_window_slot=tail_window_slot, ti=ti)  # writes idx_pool
++        if spec:
++            self.compressor.spec_advance(x, start_pos, ti)  # writes idx_pool per position
++        else:
++            self.compressor(x, start_pos, window_slots, tail_window_slot=tail_window_slot, ti=ti)  # writes idx_pool
+         weights = self.weights_proj(x) * (self.softmax_scale * self.n_heads ** -0.5)
+         keys = self.attn.indexer_keys(ti, end // ratio, ratio, self.layer_id, bsz)
+         scores = self.attn.indexer_prefill_logits(q, keys, weights)
+@@ -449,7 +540,7 @@
      def decode_step(
          self, x: torch.Tensor, qr: torch.Tensor, pos: torch.Tensor, offset: int,
          prev_window_slots: torch.Tensor, window_slots: torch.Tensor, rows: torch.Tensor,
@@ -50,7 +162,7 @@
      ) -> torch.Tensor:
          """Batched single-token indexer (EAGER/graph). Scores the first ``n_stage`` compressed
          indexer blocks per row (gathered PER ROW from the paged idx_pool), masks blocks beyond
-@@ -461,13 +468,15 @@
+@@ -461,13 +552,15 @@
          B = x.size(0)
          ratio, rd = self.compress_ratio, self.rope_head_dim
          q = self.wq_b(qr).unflatten(-1, (self.n_heads, self.head_dim))

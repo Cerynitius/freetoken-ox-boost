@@ -166,14 +166,14 @@
              cache,
              hidden_states,
              topk_weights,
-@@ -321,7 +417,29 @@
+@@ -321,6 +417,28 @@
              alphas=cache.alphas_for_slots(self.layer_id),
              is_prefill=False,
          )
 +        if pf is not None:
 +            pf.launch(self.layer_id, hidden_states)
 +        return out
- 
++
 +    def spec_set_block(self, block) -> None:
 +        # Module-level registry, NOT an attribute: block.experts -> layer ->
 +        # block would form a cycle and blow up the module-walking iterators.
@@ -192,10 +192,9 @@
 +        if blk is not None:
 +            pf.blocks.setdefault(self.layer_id, blk)
 +        return pf
-+
+ 
      def _decode_hybrid(
          self,
-         cache: OffloadMoeCache,
 @@ -380,9 +498,65 @@
          """Prefill movement: stream whole layers -- double-buffered behind the
          previous layer's GEMMs when ``prefill_overlap`` is on, else a synchronous
@@ -241,7 +240,7 @@
 +                                  device=slab.device)
 +                if hpos.numel():
 +                    # torch index ops lack Float8 kernels; route through a byte view.
-+                    if tmp.dtype == torch.float8_e4m3fn:
++                    if tmp.dtype in (torch.float8_e4m3fn, torch.float8_e8m0fnu):
 +                        tmp.view(torch.uint8).index_copy_(
 +                            0, hpos, slab.view(torch.uint8).index_select(
 +                                0, slots[hit].long()))

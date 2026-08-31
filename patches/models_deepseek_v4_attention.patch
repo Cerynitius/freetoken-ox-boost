@@ -69,7 +69,42 @@
          o = torch.einsum("bsgd,grd->bsgr", o, wo_a).flatten(2)
          return self.wo_b(o)
  
-@@ -182,7 +215,27 @@
+@@ -137,9 +170,12 @@
+             return win_global, None
+         # Only the compressor/indexer read the matched tail page's slot; resolving it costs a
+         # host sync (.item()), so do it after the ratio-0 early-out.
++        _stw = getattr(get_global_ctx().batch, "spec_tail_ws", None)
+         tail_ws = (
+-            int(self.attn.window_slots_of(ti, start_pos - 1, start_pos).item())
+-            if start_pos > 0 else None
++            _stw if _stw is not None else (
++                int(self.attn.window_slots_of(ti, start_pos - 1, start_pos).item())
++                if start_pos > 0 else None
++            )
+         )
+         if start_pos == 0:
+             self.reset()  # re-seed the compressor/indexer carry from scratch
+@@ -149,12 +185,17 @@
+             )
+             self.compressor(x_seg, 0, slots, ti=ti)
+         else:
++            _spec = getattr(get_global_ctx().batch, "spec_verify", False)
+             blocks = (
+-                self.indexer.extend(x_seg, qr_seg, start_pos, 0, slots, tail_ws, ti)
++                self.indexer.extend(x_seg, qr_seg, start_pos, 0, slots, tail_ws, ti,
++                                    spec=_spec)
+                 if self.indexer is not None
+                 else self._compress_topk_extend(n, start_pos, end, 0, device, 1)
+             )
+-            self.compressor(x_seg, start_pos, slots, tail_window_slot=tail_ws, ti=ti)
++            if _spec:
++                self.compressor.spec_advance(x_seg, start_pos, ti)
++            else:
++                self.compressor(x_seg, start_pos, slots, tail_window_slot=tail_ws, ti=ti)
+         return win_global, self.attn.blocks_to_global(blocks, ratio, ti=ti)
+ 
+     def forward_ragged(self, x, segments, flat_positions):
+@@ -182,7 +223,27 @@
          else:
              freqs = self.freqs_cis.index_select(0, flat_positions)  # [T, rd//2] per-token rope
  
@@ -98,7 +133,20 @@
          q = self.wq_b(q).unflatten(-1, (self.n_heads, self.head_dim))
          q = rms_norm(q, None, self.eps)
          apply_rotary_emb(q[..., -rd:], freqs)
-@@ -248,7 +301,7 @@
+@@ -192,6 +253,12 @@
+         apply_rotary_emb(kv[..., -rd:], freqs)
+         act_quant_fp8_inplace(kv[..., :-rd], 64)
+ 
++        # Speculative verify: stash this layer's attention inputs so the carry fix can
++        # re-advance the compressor/indexer over just the accepted prefix (spec.py).
++        _st = getattr(get_global_ctx().batch, "spec_stash", None)
++        if _st is not None and self.compress_ratio:
++            _st[self.layer_id] = (x.clone(), qr.clone())
++
+         # Per-request: persistent window write + window/compressed top-k + stateful compressor/
+         # indexer carry. Each request owns disjoint window/cmp/idx slots + ring blocks.
+         win_parts: list[torch.Tensor] = []
+@@ -248,7 +315,7 @@
  
      def decode_step(
          self, x: torch.Tensor, pos: torch.Tensor, rows: torch.Tensor, cmp_stage_cap: int,
@@ -107,17 +155,18 @@
      ) -> torch.Tensor:
          """Batched single-token attention (EAGER/graph). Per row, builds the per-query top-k as
          GLOBAL pool slots -- the live 128-window ring slots (window-first) then the first
-@@ -273,14 +326,33 @@
+@@ -273,17 +340,41 @@
          if wctx is None:
              wctx = get_global_ctx().batch.attn_metadata.window_ctx(pos, rows)
          window_slots, prev_window_slots, window_slots_topk = wctx
 -        freqs_t = self.freqs_cis.index_select(0, pos)  # [B, rd_pairs] (per-layer rope)
+-
+-        qr = q = self.q_norm(self.wq_a(x))
 +        # freqs_cis is get_freqs_cis-memoized and SHARED across same-param layers, so the
 +        # id() key dedups the gather to one per rope variant per step (was one per layer).
 +        freqs_t = dctx_get(dctx, ("freqs", id(self.freqs_cis)),
 +                           lambda: self.freqs_cis.index_select(0, pos))
- 
--        qr = q = self.q_norm(self.wq_a(x))
++
 +        _mw = getattr(self, "_qakv_w", None)
 +        if _mw is None and self.wq_a.weight.shape[0] % 128 == 0 and self.wq_a.kind == "fp8" and self.wkv.kind == "fp8":
 +            import torch as _t
@@ -144,7 +193,15 @@
          kv = self.kv_norm(kv)
          apply_rotary_emb_decode(kv[..., -rd:], freqs_t)
          act_quant_fp8_inplace(kv[..., :-rd], 64)
-@@ -292,12 +364,12 @@
++        # Spec verify: stash this layer's attention input so the post-accept carry fix
++        # can re-advance the compressors over just the accepted prefix (spec.py).
++        _st = getattr(get_global_ctx().batch, "spec_stash", None)
++        if _st is not None and self.compress_ratio:
++            _st[self.layer_id] = x.detach().clone()
+         # Persistent window write: each row's new token to its own window slot (swa_ratio=1).
+         self.attn.store_window(kv.view(B, -1), self.layer_id, window_slots)
+         # prev_window_slots (compressor rolling carry, read from the previous token's window page)
+@@ -292,12 +383,12 @@
          n_window = win
          cmp_counts = None
          if self.compress_ratio:
@@ -160,7 +217,7 @@
                  )  # [B, 1, k] block index or -1
              else:
                  # Each valid block b is its own pick (column order = block order); invalid -> -1.
-@@ -311,7 +383,9 @@
+@@ -311,7 +402,9 @@
              # order, and the indexer's top-k sorts its -1 picks (score -inf) last. So one count per
              # row bounds the kernel's loop -- read from DEVICE memory, so the captured graph's work
              # tracks the live position instead of the staged width.
