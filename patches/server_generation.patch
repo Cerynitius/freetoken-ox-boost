@@ -1,6 +1,14 @@
 --- a/python/freetoken/server/generation.py
 +++ b/python/freetoken/server/generation.py
-@@ -137,6 +137,8 @@
+@@ -14,6 +14,7 @@
+ from __future__ import annotations
+ 
+ import asyncio
++import os as _os
+ import json
+ import time
+ from collections.abc import AsyncIterator
+@@ -137,6 +138,8 @@
      messages: list[dict[str, Any]]                       # normalized, template-ready
      sampling_params: SamplingParams
      chat_template_kwargs: dict[str, Any] = field(default_factory=dict)
@@ -9,7 +17,19 @@
      template_tools: list[dict[str, Any]] | None = None   # tools the model sees (TokenizeMsg.tools)
      parser_tools: list[dict[str, Any]] | None = None     # tools for FunctionCallParser; None disables parsing
  
-@@ -198,7 +200,16 @@
+@@ -151,7 +154,10 @@
+ # Default max output (decode) tokens when a request omits one. Overridable per server via
+ # --max-output-tokens (the Responses adapter passes that through); clamped to the remaining
+ # context by the scheduler regardless.
+-DEFAULT_MAX_OUTPUT_TOKENS = 32768
++# Default output budget when the client omits max_tokens. Set to the full context:
++# the scheduler already clamps every request to (max_seq_len - input_len), so this
++# just means "generate until EOS or the context is full" instead of an arbitrary cap.
++DEFAULT_MAX_OUTPUT_TOKENS = int(_os.getenv("FREETOKEN_DEFAULT_MAX_OUTPUT_TOKENS", "262144"))
+ 
+ 
+ def resolve_sampling(
+@@ -198,7 +204,16 @@
      m = dict(message)
      content = m.get("content")
      if isinstance(content, list):
@@ -27,7 +47,7 @@
      # Templates read different reasoning keys (reasoning_content: most; reasoning:
      # gemma4; thinking: gpt-oss) — accept any, emit both.
      reasoning = m.get("reasoning_content") or m.get("reasoning") or m.get("thinking")
-@@ -228,8 +239,62 @@
+@@ -228,8 +243,62 @@
              rendered.append(tc)
          m["tool_calls"] = rendered
      return m
@@ -63,7 +83,7 @@
 +                    decode_image_part,
 +                    preprocess_image,
 +                )
- 
++
 +                img = decode_image_part(part.get("image_url") or part.get("image"))
 +                pixels, grid = preprocess_image(img)
 +                # Transport-safe payload: the ZMQ msgpack codec only carries
@@ -75,7 +95,7 @@
 +                    decode_video_part,
 +                    preprocess_video,
 +                )
-+
+ 
 +                frames, ts = decode_video_part(part.get("video_url") or part.get("video"))
 +                pixels, grid, unit_ts = preprocess_video(frames, ts)
 +                images.append({
@@ -90,7 +110,7 @@
  def _flatten_text_parts(parts: list[Any]) -> str:
      texts: list[str] = []
      for part in parts:
-@@ -269,6 +334,7 @@
+@@ -269,6 +338,7 @@
              sampling_params=spec.sampling_params,
              chat_template_kwargs=spec.chat_template_kwargs,
              tools=spec.template_tools,
