@@ -87,6 +87,17 @@ fi
 [[ -f "$MODEL/inference/config.json" ]]        || { echo "FATAL: missing inference/config.json in $MODEL" >&2; exit 1; }
 echo "preconditions ok: VRAM used ${USED} MiB, MemAvailable ${AVAIL} GiB, checkpoint present"
 
+export FREETOKEN_PREFILL_ONDEMAND_TOKENS=${FREETOKEN_PREFILL_ONDEMAND_TOKENS:-512}
+# post-boot self-warmup: absorbs the first-request cold outlier (triton compiles, cold caches)
+(
+  for _i in $(seq 1 90); do
+    sleep 10
+    curl -s -m 8 "http://127.0.0.1:${DSV4_PORT:-1919}/v1/chat/completions" \
+      -H "Content-Type: application/json" \
+      -d "{\"model\":\"${DSV4_NAME:-dsv4-flash}\",\"messages\":[{\"role\":\"user\",\"content\":\"warmup\"}],\"max_tokens\":2}" \
+      | grep -q choices && break
+  done
+) >/dev/null 2>&1 &
 exec /home/zrx/miniconda3/envs/freetoken/bin/ft serve \
   --model "$MODEL" \
   --served-model-name ${DSV4_NAME:-dsv4-flash} \
@@ -98,4 +109,3 @@ exec /home/zrx/miniconda3/envs/freetoken/bin/ft serve \
   --kv-reserve-tokens "$CTX" \
   --max-seq-len-override "$CTX" \
   --max-running-requests ${DSV4_MAX_RUNNING:-12}
-export FREETOKEN_PREFILL_ONDEMAND_TOKENS=${FREETOKEN_PREFILL_ONDEMAND_TOKENS:-512}

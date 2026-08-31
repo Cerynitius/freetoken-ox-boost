@@ -108,7 +108,7 @@ aggregate (moe-cache-auto = 6000 experts resident, ~75 GB).
 | Item | Measured | Files | Switch |
 |---|---|---|---|
 | Native-FP8 wo_a grouped GEMV (M<=16 single launch) + FP8 lm_head + fused act-quant GEMV | single 51.2 -> 55.0, conc2 +7% | `patches: kernel_triton_dsv4_fp8_linear / models_deepseek_v4_{attention,model,weight}` | `FREETOKEN_DSV4_WOA_FP8` / `HEAD_FP8` (1) |
-| Short-extend on-demand prefill threshold 48 -> 512 | cold 60-500-token TTFT 1.7 s -> 0.5-0.8 s; warm long-prompt extends 0.73-0.8 s; quality 15/15 | `patches: layers_moe` (threshold) + `examples/serve_dsv4.sh` | `FREETOKEN_PREFILL_ONDEMAND_TOKENS` (512) |
+| Short-extend on-demand prefill threshold 48 -> 512 | cold 60-500-token TTFT 1.7 s -> 0.5-0.8 s; warm long-prompt extends 0.73-0.8 s; quality 15/15. Threshold 1024 tested and REJECTED: the single-request crossover sits at ~1200-1500 tokens, but 500-1024-token on-demand prefills thrash the expert LRU and push cold streaming (>1024) from ~1.7 s to ~2.5 s | `patches: layers_moe` (threshold) + `examples/serve_dsv4.sh` | `FREETOKEN_PREFILL_ONDEMAND_TOKENS` (512) |
 | e8m0 scale-slab index_copy fix (on-demand prefill hit path crashed the engine for any extend > threshold) | correctness fix | `patches: layers_moe` | none |
 | spec_alloc_len comfort gate in tokens (page_size-aware; was permanently 0 horizon on 128-token pages) | correctness fix for any spec on paged models | `patches: scheduler_cache` | none |
 
