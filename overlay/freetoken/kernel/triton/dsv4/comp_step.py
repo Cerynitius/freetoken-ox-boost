@@ -131,27 +131,34 @@ def _comp_step128_kernel(
     sc_new = tl.load(sc_ptr + b * D + offs, mask=mask, other=0.0) + tl.load(
         ape_ptr + im * D + offs, mask=mask, other=0.0)
 
-    # pass 1: max over the 128 register rows (row im replaced by the new value)
+    # Row-TILED two-pass pool (16 rows per load: a serial 128-iteration load chain
+    # is pure latency, ~52 us/launch). Reduction order is per-tile tree + tile-major,
+    # a <=1ulp departure from the eager row-sequential gated_pool.
+    rt = tl.arange(0, 16)
+    m2 = mask[None, :]
     m = tl.full((BLOCK,), float("-inf"), tl.float32)
-    for r in tl.range(0, 128):
-        s = tl.load(ring_ptr + (pb + r) * stride + D + offs, mask=mask,
-                    other=float("-inf"))
-        s = tl.where(r == im, sc_new, s)
-        m = tl.maximum(m, s)
-    # pass 2: pooled accumulate in row order + copy-through write to the cur block
+    for t in tl.static_range(8):
+        rows = t * 16 + rt
+        s = tl.load(ring_ptr + (pb + rows)[:, None] * stride + D + offs[None, :],
+                    mask=m2, other=float("-inf"))
+        s = tl.where((rows == im)[:, None], sc_new[None, :], s)
+        m = tl.maximum(m, tl.max(s, axis=0))
     denom = tl.zeros((BLOCK,), tl.float32)
     acc = tl.zeros((BLOCK,), tl.float32)
-    for r in tl.range(0, 128):
-        k = tl.load(ring_ptr + (pb + r) * stride + offs, mask=mask, other=0.0)
-        s = tl.load(ring_ptr + (pb + r) * stride + D + offs, mask=mask,
-                    other=float("-inf"))
-        k = tl.where(r == im, kv_new, k)
-        s = tl.where(r == im, sc_new, s)
-        w = tl.exp(s - m)
-        denom += w
-        acc += w * k
-        tl.store(ring_ptr + (cb + r) * stride + offs, k, mask=mask)
-        tl.store(ring_ptr + (cb + r) * stride + D + offs, s, mask=mask)
+    for t in tl.static_range(8):
+        rows = t * 16 + rt
+        k = tl.load(ring_ptr + (pb + rows)[:, None] * stride + offs[None, :],
+                    mask=m2, other=0.0)
+        s = tl.load(ring_ptr + (pb + rows)[:, None] * stride + D + offs[None, :],
+                    mask=m2, other=float("-inf"))
+        hit = (rows == im)[:, None]
+        k = tl.where(hit, kv_new[None, :], k)
+        s = tl.where(hit, sc_new[None, :], s)
+        w = tl.exp(s - m[None, :])
+        denom += tl.sum(w, axis=0)
+        acc += tl.sum(w * k, axis=0)
+        tl.store(ring_ptr + (cb + rows)[:, None] * stride + offs[None, :], k, mask=m2)
+        tl.store(ring_ptr + (cb + rows)[:, None] * stride + D + offs[None, :], s, mask=m2)
     tl.store(out_ptr + b * D + offs, acc / denom, mask=mask)
 
 
