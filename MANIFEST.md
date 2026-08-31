@@ -132,3 +132,11 @@ Same verdict class as the GLM MTP attempt (-13%). Kept env-gated OFF.
 | Files | Switch |
 |---|---|
 | `overlay: models/deepseek_v4/{dspark,spec,dspark_load}.py`, `kernel/triton/dsv4/spec_chain.py`; `patches: models_deepseek_v4_{model,attention,compress} / engine_engine / scheduler_cache` | `FREETOKEN_DSV4_SPEC` (0) + `FREETOKEN_DSV4_SPEC_CKPT` (checkpoint dir); diagnostics: `FREETOKEN_DSV4_SPEC_LOG`, `FREETOKEN_DSV4_SPEC_EAGER`, `FREETOKEN_DSV4_SPEC_CONF` |
+
+### DSV4 round 3 (single-stream 55 -> 58+)
+
+| Item | Measured | Files | Switch |
+|---|---|---|---|
+| Fused compressor decode step (register roll: read/scatter/pool/promote/write in ONE launch x 62 tier-instances, ape in-kernel, bit-parity pool order) | +1.1 tok/s (55 -> 56) | `overlay: kernel/triton/dsv4/comp_step.py` + `patches: models_deepseek_v4_compress` | `FREETOKEN_DSV4_FUSED_COMP` (1) |
+| sqrtsoftplus fused route (softplus/sqrt/+bias/topk/gather/renorm/scale, ~8 launches -> 1 x 40 layers; stable softplus form) | +2.2 tok/s (56 -> 58.1), quality 15/15 | `overlay: kernel/triton/fused_route.py` (ACT constexpr) + `patches: models_deepseek_v4_moe` | `FREETOKEN_FUSED_ROUTE` (1) |
+| memory-ratio 0.95 + cache 6200 | no gain (hit already 97.6%) | -- | rejected |

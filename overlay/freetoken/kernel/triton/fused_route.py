@@ -20,12 +20,19 @@ def _fused_route_kernel(
     logits_ptr, bias_ptr, w_ptr, id_ptr,
     stride_lm, scaling,
     E: tl.constexpr, TOPK: tl.constexpr, RENORM: tl.constexpr, BLOCK: tl.constexpr,
+    ACT: tl.constexpr,
 ):
     m = tl.program_id(0)
     offs = tl.arange(0, BLOCK)
     mask = offs < E
     lg = tl.load(logits_ptr + m * stride_lm + offs, mask=mask, other=0.0).to(tl.float32)
-    sc = tl.sigmoid(lg)
+    if ACT == 1:
+        # sqrt(softplus), overflow-stable: max(x,0) + log(1 + exp(-|x|)) -- the log
+        # argument sits in (1, 2], full fp32 precision (<=1ulp vs ATen threshold form)
+        sp = tl.maximum(lg, 0.0) + tl.log(1.0 + tl.exp(-tl.abs(lg)))
+        sc = tl.sqrt(sp)
+    else:
+        sc = tl.sigmoid(lg)
     bias = tl.load(bias_ptr + offs, mask=mask, other=0.0).to(tl.float32)
     s4c = tl.where(mask, sc + bias, float("-inf"))
     wsum = 0.0
@@ -49,6 +56,7 @@ def fused_route(
     top_k: int,
     renorm: bool,
     scaling: float,
+    act: str = "sigmoid",
 ):
     M, E = logits.shape
     w = torch.empty(M, top_k, dtype=torch.float32, device=logits.device)
@@ -56,6 +64,7 @@ def fused_route(
     _fused_route_kernel[(M,)](
         logits, bias, w, ids, logits.stride(0), scaling,
         E=E, TOPK=top_k, RENORM=renorm, BLOCK=triton.next_power_of_2(E),
+        ACT=1 if act == "sqrtsoftplus" else 0,
         num_warps=4,
     )
     return w, ids

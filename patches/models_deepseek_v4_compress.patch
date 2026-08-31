@@ -1,6 +1,17 @@
 --- a/python/freetoken/models/deepseek_v4/compress.py
 +++ b/python/freetoken/models/deepseek_v4/compress.py
-@@ -13,7 +13,7 @@
+@@ -6,6 +6,10 @@
+ from torch import nn
+ 
+ from freetoken.core import get_global_ctx
++
++import os as _os
++
++_FUSED_COMP = _os.environ.get("FREETOKEN_DSV4_FUSED_COMP", "1") == "1"
+ from freetoken.kernel.triton.dsv4.bf16_linear import bf16_linear_fp32
+ from freetoken.kernel.triton.dsv4.compress import gated_pool
+ from freetoken.kernel.triton.dsv4.fp8_linear import act_quant_fp8_inplace, fp4_act_quant_inplace
+@@ -13,7 +17,7 @@
  
  from .args import DeepseekV4Args
  from .layers import Linear, RMSNorm
@@ -9,7 +20,7 @@
  
  
  class Compressor(nn.Module):
-@@ -291,9 +291,83 @@
+@@ -291,9 +295,83 @@
          )
          return reduced
  
@@ -94,7 +105,7 @@
      ) -> None:
          """Batched single-token compressor update (EAGER/graph; ``pos``/``prev_window_slots``/
          ``window_slots`` are GPU int tensors ``[B]``; ``rows`` is the LOCAL row index [B] into the
-@@ -306,15 +380,26 @@
+@@ -306,41 +384,69 @@
          -> disjoint ring blocks, so co-tenant rows never contaminate each other."""
          assert self.cmp_pool is not None
          B = x.size(0)
@@ -109,23 +120,92 @@
 -        kv = bf16_linear_fp32(x, self.wkv.weight).view(B, 1, item)
 -        score = bf16_linear_fp32(x, self.wgate.weight).view(B, 1, item)
 -        idx_mod = pos % ratio  # [B]
+-        score = score + self.ape.index_select(0, idx_mod).view(B, 1, item)
+-        should = ((pos + 1) % ratio == 0).view(B, 1, 1)
+-
+-        # Read each row's rolling carry block from the PREVIOUS token's page (ks|ss split at item).
+-        block = self.attn.read_carry_blocks(  # [B, ring_size, 2*item]
+-            self.layer_id, self.tier, prev_window_slots, self.ring_size
+-        )
+-        ks = block[..., :item].clone()  # [B, ring_size, item]
+-        ss = block[..., item:].clone()
+-
+-        if overlap:
+-            wslot = (ratio + idx_mod).view(B, 1)  # per-row B-half slot
+-            ks.scatter_(1, wslot.unsqueeze(-1).expand(B, 1, item), kv)
+-            ss.scatter_(1, wslot.unsqueeze(-1).expand(B, 1, item), score)
+-            kv_eff = torch.cat([ks[:, :ratio, :d], ks[:, ratio:, d:]], dim=1)
+-            score_eff = torch.cat([ss[:, :ratio, :d], ss[:, ratio:, d:]], dim=1)
+-            compressed = gated_pool(kv_eff, score_eff, dtype)
+-            ks[:, :ratio] = torch.where(should, ks[:, ratio:], ks[:, :ratio])
+-            ss[:, :ratio] = torch.where(should, ss[:, ratio:], ss[:, :ratio])
 +        # wkv|wgate share the input: one concatenated GEMV instead of two (row-independent
 +        # dot products -> identical per-row results). Lazy cat on first (uncaptured) call.
 +        w2 = getattr(self, "_kvgate_w", None)
 +        if w2 is None:
 +            w2 = self._kvgate_w = torch.cat([self.wkv.weight, self.wgate.weight], 0).contiguous()
 +        kvs = bf16_linear_fp32(x, w2)
-+        kv = kvs[:, :item].view(B, 1, item)
-+        score = kvs[:, item:].contiguous().view(B, 1, item)
 +        idx_mod = dctx_get(dctx, ("idx_mod", ratio), lambda: pos % ratio)
-         score = score + self.ape.index_select(0, idx_mod).view(B, 1, item)
--        should = ((pos + 1) % ratio == 0).view(B, 1, 1)
 +        should = dctx_get(dctx, ("should", ratio),
 +                          lambda: ((pos + 1) % ratio == 0).view(B, 1, 1))
++
++        if _FUSED_COMP:
++            # One launch: register read + scatter + gated pool + promotion + write,
++            # straight on the ring buffer; ape added in-kernel; pool accumulation
++            # order matches the eager gated_pool bit-for-bit.
++            from freetoken.kernel.triton.dsv4.comp_step import fused_comp_step
++
++            ring = self.attn.compress_state_ring(self.layer_id, self.tier)
++            prev_base = self.attn.ring_page_base(prev_window_slots, self.ring_size)
++            cur_base = self.attn.ring_page_base(window_slots, self.ring_size)
++            pooled = fused_comp_step(
++                ring.buffer, kvs[:, :item], kvs[:, item:], self.ape,
++                prev_base, cur_base, idx_mod, should.view(B),
++                self.overlap, self.head_dim,
++            )
++            compressed = pooled.to(dtype).unsqueeze(1)   # [B, 1, d]
+         else:
+-            ks.scatter_(1, idx_mod.view(B, 1, 1).expand(B, 1, item), kv)
+-            ss.scatter_(1, idx_mod.view(B, 1, 1).expand(B, 1, item), score)
+-            compressed = gated_pool(ks, ss, dtype)
+-        # Persist the advanced carry block to THIS token's page (per row, disjoint blocks); the
+-        # next step reads it from here. Within a page prev==cur, so this is a self-consistent roll.
+-        self.attn.write_carry_blocks(
+-            self.layer_id, self.tier, window_slots, self.ring_size, torch.cat([ks, ss], dim=-1)
+-        )
++            kv = kvs[:, :item].view(B, 1, item)
++            score = kvs[:, item:].contiguous().view(B, 1, item)
++            score = score + self.ape.index_select(0, idx_mod).view(B, 1, item)
++
++            # Read each row's rolling carry block from the PREVIOUS token's page (ks|ss split at item).
++            block = self.attn.read_carry_blocks(  # [B, ring_size, 2*item]
++                self.layer_id, self.tier, prev_window_slots, self.ring_size
++            )
++            ks = block[..., :item].clone()  # [B, ring_size, item]
++            ss = block[..., item:].clone()
++
++            if overlap:
++                wslot = (ratio + idx_mod).view(B, 1)  # per-row B-half slot
++                ks.scatter_(1, wslot.unsqueeze(-1).expand(B, 1, item), kv)
++                ss.scatter_(1, wslot.unsqueeze(-1).expand(B, 1, item), score)
++                kv_eff = torch.cat([ks[:, :ratio, :d], ks[:, ratio:, d:]], dim=1)
++                score_eff = torch.cat([ss[:, :ratio, :d], ss[:, ratio:, d:]], dim=1)
++                compressed = gated_pool(kv_eff, score_eff, dtype)
++                ks[:, :ratio] = torch.where(should, ks[:, ratio:], ks[:, :ratio])
++                ss[:, :ratio] = torch.where(should, ss[:, ratio:], ss[:, :ratio])
++            else:
++                ks.scatter_(1, idx_mod.view(B, 1, 1).expand(B, 1, item), kv)
++                ss.scatter_(1, idx_mod.view(B, 1, 1).expand(B, 1, item), score)
++                compressed = gated_pool(ks, ss, dtype)
++            # Persist the advanced carry block to THIS token's page (per row, disjoint blocks); the
++            # next step reads it from here. Within a page prev==cur, so this is a self-consistent roll.
++            self.attn.write_carry_blocks(
++                self.layer_id, self.tier, window_slots, self.ring_size, torch.cat([ks, ss], dim=-1)
++            )
  
-         # Read each row's rolling carry block from the PREVIOUS token's page (ks|ss split at item).
-         block = self.attn.read_carry_blocks(  # [B, ring_size, 2*item]
-@@ -425,10 +510,13 @@
+         compressed = self.norm(compressed)
+         freqs_t = self.freqs_cis.index_select(0, (pos + 1 - ratio).clamp_min(0))  # [B, rd//2]
+@@ -425,10 +531,13 @@
              topk=self.index_topk, offset=offset,
          )
  
@@ -141,7 +221,7 @@
          bsz, seqlen, _ = x.size()
          end = start_pos + seqlen
          freqs_cis = self.freqs_cis[start_pos:end]
-@@ -437,7 +525,10 @@
+@@ -437,7 +546,10 @@
          apply_rotary_emb(q[..., -rd:], freqs_cis)
          q = hadamard_transform(q)
          fp4_act_quant_inplace(q, 32)
@@ -153,7 +233,7 @@
          weights = self.weights_proj(x) * (self.softmax_scale * self.n_heads ** -0.5)
          keys = self.attn.indexer_keys(ti, end // ratio, ratio, self.layer_id, bsz)
          scores = self.attn.indexer_prefill_logits(q, keys, weights)
-@@ -449,7 +540,7 @@
+@@ -449,7 +561,7 @@
      def decode_step(
          self, x: torch.Tensor, qr: torch.Tensor, pos: torch.Tensor, offset: int,
          prev_window_slots: torch.Tensor, window_slots: torch.Tensor, rows: torch.Tensor,
@@ -162,7 +242,7 @@
      ) -> torch.Tensor:
          """Batched single-token indexer (EAGER/graph). Scores the first ``n_stage`` compressed
          indexer blocks per row (gathered PER ROW from the paged idx_pool), masks blocks beyond
-@@ -461,13 +552,15 @@
+@@ -461,13 +573,15 @@
          B = x.size(0)
          ratio, rd = self.compress_ratio, self.rope_head_dim
          q = self.wq_b(qr).unflatten(-1, (self.n_heads, self.head_dim))

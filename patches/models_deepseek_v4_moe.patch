@@ -9,10 +9,20 @@
  import torch
  import torch.nn.functional as F
  from torch import nn
-@@ -35,6 +37,16 @@
+@@ -35,6 +37,26 @@
  
      def forward(self, x: torch.Tensor, input_ids: torch.Tensor):
          scores = bf16_linear_fp32(x, self.weight)
++        if (
++            self.score_func == "sqrtsoftplus" and not self.hash and self.bias is not None
++            and _os.environ.get("FREETOKEN_FUSED_ROUTE", "1") == "1"
++        ):
++            # tail-fusion, sqrtsoftplus flavor: softplus/sqrt/+bias/topk/gather/renorm
++            # in one kernel. Deltas vs eager: <=1ulp log1p rounding, +1e-20 renorm.
++            from freetoken.kernel.triton.fused_route import fused_route
++
++            return fused_route(scores, self.bias, self.topk, True, self.route_scale,
++                               act="sqrtsoftplus")
 +        if (
 +            self.score_func == "sigmoid" and not self.hash and self.bias is not None
 +            and _os.environ.get("FREETOKEN_FUSED_ROUTE", "1") == "1"
@@ -26,7 +36,7 @@
          if self.score_func == "softmax":
              scores = scores.softmax(dim=-1)
          elif self.score_func == "sigmoid":
-@@ -66,7 +78,22 @@
+@@ -66,7 +88,22 @@
          self.swiglu_limit = swiglu_limit
  
      def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -50,24 +60,7 @@
          return self.w2(h)
  
  
-@@ -100,10 +127,14 @@
-         # keeps short-prompt slot residency -- hence hybrid decode's GPU/CPU
-         # route split -- unchanged). Mixing modes across chunks is safe: the
-         # streaming buffers disown their borrowed slots on invalidation.
--        if hidden_states.shape[0] * self.top_k >= self.num_experts:
--            return super()._prefill_routed(hidden_states, topk_weights, topk_ids)
-         cache = self.offload_cache
-         assert cache is not None
-+        # unpinned (LOCKED) layers must take the base materialize path: their copy_missing is the whole-layer pageable branch with position == expert id, which ensure_experts's LRU slot remap would contradict (the GEMM would gather other experts' weights)
-+        if (
-+            hidden_states.shape[0] * self.top_k >= self.num_experts
-+            or cache.is_unpinned_layer(self.layer_id)
-+        ):
-+            return super()._prefill_routed(hidden_states, topk_weights, topk_ids)
-         cache.ensure_experts(self.layer_id, topk_ids)  # in-place expert-id -> slot
-         cache.copy_missing()
-         if cache.collect_stats:
-@@ -129,18 +160,42 @@
+@@ -133,18 +170,42 @@
          self.gate = Gate(layer_id, args)
          self.shared_experts = Expert(args.dim, args.moe_inter_dim, args.swiglu_limit)
          self.experts = DSV4OffloadMoELayer(layer_id, args)
