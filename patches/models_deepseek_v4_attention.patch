@@ -1,6 +1,15 @@
 --- a/python/freetoken/models/deepseek_v4/attention.py
 +++ b/python/freetoken/models/deepseek_v4/attention.py
-@@ -14,7 +14,7 @@
+@@ -3,6 +3,8 @@
+ 
+ from __future__ import annotations
+ 
++import os
++
+ import torch
+ import torch.nn.functional as F
+ from torch import nn
+@@ -14,7 +16,7 @@
  from .args import DeepseekV4Args
  from .compress import Compressor, Indexer
  from .layers import Linear, RMSNorm, get_compress_topk_idxs, get_window_topk_idxs
@@ -9,7 +18,58 @@
  
  
  class Attention(nn.Module):
-@@ -182,7 +182,27 @@
+@@ -49,7 +51,19 @@
+         # wo_a: dequantized to bf16 (reference runs a bf16 grouped-output einsum).
+         wo_a_rows = self.n_groups * args.o_lora_rank
+         wo_a_k = self.n_heads * self.head_dim // self.n_groups
+-        self.wo_a = nn.Parameter(torch.empty(wo_a_rows, wo_a_k, dtype=torch.bfloat16), requires_grad=False)
++        # FREETOKEN_DSV4_WOA_FP8=1: keep wo_a in its checkpoint-native FP8 (128x128
++        # e8m0 blocks) and run decode through the grouped FP8 GEMV -- wo_a is the
++        # largest remaining BF16 read of the decode step (67 MB/layer). The reference
++        # runs this einsum in BF16, so the FP8 activation quant is a numerics change;
++        # gate behind the quality battery before defaulting on.
++        self._woa_fp8 = os.environ.get("FREETOKEN_DSV4_WOA_FP8", "0") == "1"
++        if self._woa_fp8:
++            self.wo_a_q = nn.Parameter(
++                torch.empty(wo_a_rows, wo_a_k, dtype=torch.float8_e4m3fn), requires_grad=False)
++            self.wo_a_s = nn.Parameter(
++                torch.empty(wo_a_rows // 128, wo_a_k // 128, dtype=torch.uint8), requires_grad=False)
++        else:
++            self.wo_a = nn.Parameter(torch.empty(wo_a_rows, wo_a_k, dtype=torch.bfloat16), requires_grad=False)
+         self.wo_b = Linear(self.n_groups * args.o_lora_rank, self.dim, kind="fp8")
+         self.softmax_scale = self.head_dim ** -0.5
+ 
+@@ -98,9 +112,28 @@
+             self.indexer.reset()
+ 
+ 
++    def _woa_dequant(self) -> torch.Tensor:
++        """Per-call BF16 scratch for the (rare) non-GEMV paths under WOA_FP8: block
++        128x128 dequant of the native FP8 weight (~67 MB write, ~70 us -- negligible
++        against a prefill chunk; avoids keeping a persistent 2.7 GB BF16 copy)."""
++        rows, k = self.wo_a_q.shape
++        sc = torch.exp2(self.wo_a_s.float() - 127.0)
++        w = self.wo_a_q.float().view(rows // 128, 128, k // 128, 128)
++        return (w * sc[:, None, :, None]).view(rows, k).to(torch.bfloat16)
++
+     def _wo(self, o: torch.Tensor, bsz: int, seqlen: int) -> torch.Tensor:
+         o = o.reshape(bsz, seqlen, self.n_groups, -1)
+-        wo_a = self.wo_a.view(self.n_groups, self.o_lora_rank, -1)
++        if self._woa_fp8:
++            T = bsz * seqlen
++            if T <= 16:  # decode batches (single + concurrent): single-launch grouped FP8
++                from freetoken.kernel.triton.dsv4.fp8_linear import grouped_fp8_gemv
++
++                r = grouped_fp8_gemv(
++                    o.reshape(T, -1), self.wo_a_q, self.wo_a_s, self.n_groups)
++                return self.wo_b(r.view(bsz, seqlen, -1))
++            wo_a = self._woa_dequant().view(self.n_groups, self.o_lora_rank, -1)
++        else:
++            wo_a = self.wo_a.view(self.n_groups, self.o_lora_rank, -1)
+         o = torch.einsum("bsgd,grd->bsgr", o, wo_a).flatten(2)
+         return self.wo_b(o)
+ 
+@@ -182,7 +215,27 @@
          else:
              freqs = self.freqs_cis.index_select(0, flat_positions)  # [T, rd//2] per-token rope
  
@@ -38,7 +98,7 @@
          q = self.wq_b(q).unflatten(-1, (self.n_heads, self.head_dim))
          q = rms_norm(q, None, self.eps)
          apply_rotary_emb(q[..., -rd:], freqs)
-@@ -248,7 +268,7 @@
+@@ -248,7 +301,7 @@
  
      def decode_step(
          self, x: torch.Tensor, pos: torch.Tensor, rows: torch.Tensor, cmp_stage_cap: int,
@@ -47,7 +107,7 @@
      ) -> torch.Tensor:
          """Batched single-token attention (EAGER/graph). Per row, builds the per-query top-k as
          GLOBAL pool slots -- the live 128-window ring slots (window-first) then the first
-@@ -273,14 +293,33 @@
+@@ -273,14 +326,33 @@
          if wctx is None:
              wctx = get_global_ctx().batch.attn_metadata.window_ctx(pos, rows)
          window_slots, prev_window_slots, window_slots_topk = wctx
@@ -84,7 +144,7 @@
          kv = self.kv_norm(kv)
          apply_rotary_emb_decode(kv[..., -rd:], freqs_t)
          act_quant_fp8_inplace(kv[..., :-rd], 64)
-@@ -292,12 +331,12 @@
+@@ -292,12 +364,12 @@
          n_window = win
          cmp_counts = None
          if self.compress_ratio:
@@ -100,7 +160,7 @@
                  )  # [B, 1, k] block index or -1
              else:
                  # Each valid block b is its own pick (column order = block order); invalid -> -1.
-@@ -311,7 +350,9 @@
+@@ -311,7 +383,9 @@
              # order, and the indexer's top-k sorts its -1 picks (score -inf) last. So one count per
              # row bounds the kernel's loop -- read from DEVICE memory, so the captured graph's work
              # tracks the live position instead of the staged width.

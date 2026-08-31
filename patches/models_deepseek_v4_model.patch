@@ -1,6 +1,15 @@
 --- a/python/freetoken/models/deepseek_v4/model.py
 +++ b/python/freetoken/models/deepseek_v4/model.py
-@@ -28,6 +28,7 @@
+@@ -21,6 +21,8 @@
+ 
+ from __future__ import annotations
+ 
++import os
++
+ import torch
+ import torch.nn.functional as F
+ from torch import nn
+@@ -28,6 +30,7 @@
  from freetoken.core import get_global_ctx
  from freetoken.kernel.triton.dsv4.hc import hc_post_combine, hc_pre_combine
  from freetoken.kernel.triton.dsv4.sinkhorn import hc_split_sinkhorn
@@ -8,7 +17,7 @@
  from freetoken.models.blocks import BaseLLMModel
  
  from .args import DeepseekV4Args
-@@ -72,15 +73,18 @@
+@@ -72,15 +75,18 @@
          self.hc_ffn_scale = nn.Parameter(torch.empty(3, dtype=torch.float32), requires_grad=False)
  
      def hc_pre(self, x, hc_fn, hc_scale, hc_base):
@@ -33,7 +42,7 @@
          return y, post.view(M, self.hc_mult), comb.view(M, self.hc_mult, self.hc_mult)
  
      def hc_post(self, x, residual, post, comb):
-@@ -112,11 +116,11 @@
+@@ -112,11 +118,11 @@
          x = self.hc_post(x, residual, post, comb)
          return x
  
@@ -47,7 +56,27 @@
          x = self.hc_post(x, residual, post, comb)
  
          residual = x
-@@ -151,12 +155,12 @@
+@@ -138,7 +144,18 @@
+         self.embed.weight.requires_grad_(False)
+         self.layers = nn.ModuleList([Block(i, args) for i in range(args.n_layers)])
+         self.norm = RMSNorm(args.dim, self.norm_eps)
+-        self.head = nn.Parameter(torch.empty(args.vocab_size, args.dim, dtype=torch.bfloat16), requires_grad=False)
++        # FREETOKEN_DSV4_HEAD_FP8=1: W8A16 lm_head (fp8-e4m3 + per-row scale, quantized
++        # at load) -- the full-vocab logits GEMV reads ~1 GB of bf16 every decode step
++        # (measured 670 us, 3.7% of the step); fp8 halves it. Same scheme as GlmFp8LMHead.
++        self._head_fp8 = os.environ.get("FREETOKEN_DSV4_HEAD_FP8", "0") == "1"
++        if self._head_fp8:
++            self.head = nn.Parameter(
++                torch.empty(args.vocab_size, args.dim, dtype=torch.float8_e4m3fn),
++                requires_grad=False)
++            self.head_scale = nn.Parameter(
++                torch.empty(args.vocab_size, dtype=torch.float32), requires_grad=False)
++        else:
++            self.head = nn.Parameter(torch.empty(args.vocab_size, args.dim, dtype=torch.bfloat16), requires_grad=False)
+         hc_dim = hc_mult * args.dim
+         self.hc_head_fn = nn.Parameter(torch.empty(hc_mult, hc_dim, dtype=torch.float32), requires_grad=False)
+         self.hc_head_base = nn.Parameter(torch.empty(hc_mult, dtype=torch.float32), requires_grad=False)
+@@ -151,12 +168,12 @@
      def hc_head(self, x):
          shape, dtype = x.size(), x.dtype
          dim = self.args.dim
@@ -65,7 +94,18 @@
  
      def prefill_batched(
          self, input_ids: torch.Tensor, segments, flat_positions: torch.Tensor,
-@@ -202,8 +206,11 @@
+@@ -178,6 +195,10 @@
+             h = layer.prefill_batched(h, input_ids, segments, flat_positions)
+         h = self.hc_head(h)
+         h = self.norm(h)
++        if self._head_fp8:
++            from freetoken.kernel.triton.fp8_pertensor_linear import fp8_pertensor_linear
++
++            return fp8_pertensor_linear(h[0, last_indices].contiguous(), self.head, self.head_scale)
+         return F.linear(h[0, last_indices], self.head)  # [B, vocab]
+ 
+     def decode(
+@@ -202,10 +223,17 @@
          # into every layer. They read only the shared snapshot / positions, so they are identical
          # across layers.
          wctx = get_global_ctx().batch.attn_metadata.window_ctx(pos, rows)
@@ -77,4 +117,10 @@
 +            h = layer.decode_step(h, pos, rows, cmp_stage_cap, input_ids, wctx, dctx)
          h = self.hc_head(h)
          h = self.norm(h)
++        if self._head_fp8:
++            from freetoken.kernel.triton.fp8_pertensor_linear import fp8_pertensor_linear
++
++            return fp8_pertensor_linear(h[:, -1].contiguous(), self.head, self.head_scale)
          return F.linear(h[:, -1], self.head)
+ 
+ 

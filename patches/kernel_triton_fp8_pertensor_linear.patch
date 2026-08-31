@@ -1,6 +1,6 @@
 --- a/python/freetoken/kernel/triton/fp8_pertensor_linear.py
 +++ b/python/freetoken/kernel/triton/fp8_pertensor_linear.py
-@@ -121,6 +121,98 @@
+@@ -121,6 +121,100 @@
  
  
  # ======================================================================================
@@ -12,7 +12,7 @@
 +# ======================================================================================
 +@triton.jit
 +def _gemv_splitk_m_kernel(
-+    a_ptr, w_ptr, part_ptr, N, K, n_kb, kb_per,
++    a_ptr, w_ptr, part_ptr, N, K, M, n_kb, kb_per,
 +    stride_am, stride_ak, stride_wn, stride_wk, stride_pk, stride_pm, stride_pn,
 +    M_TILE: tl.constexpr, BLOCK_N: tl.constexpr, BLOCK_K: tl.constexpr,
 +):
@@ -41,12 +41,14 @@
 +            # per-row dot exactly like the M==1 kernel; the tiny [M, N_b] where-add
 +            # routes each row's contribution without an indexable accumulator.
 +            for m in tl.static_range(M_TILE):
-+                a_m = tl.load(a_ptr + m * stride_am + offs_k * stride_ak,
-+                              mask=k_mask, other=0.0).to(tl.float32)
-+                c = tl.sum(w * a_m[None, :], axis=1)           # [N_b]
-+                acc = acc + tl.where(offs_m[:, None] == m, c[None, :], 0.0)
++                if m < M:  # M_TILE is M padded to pow2 (tl.arange constraint)
++                    a_m = tl.load(a_ptr + m * stride_am + offs_k * stride_ak,
++                                  mask=k_mask, other=0.0).to(tl.float32)
++                    c = tl.sum(w * a_m[None, :], axis=1)       # [N_b]
++                    acc = acc + tl.where(offs_m[:, None] == m, c[None, :], 0.0)
++    m_mask = offs_m < M
 +    p_ptrs = part_ptr + pid_k * stride_pk + offs_m[:, None] * stride_pm + offs_n[None, :] * stride_pn
-+    tl.store(p_ptrs, acc, mask=n_mask[None, :])
++    tl.store(p_ptrs, acc, mask=m_mask[:, None] & n_mask[None, :])
 +
 +
 +@triton.jit
@@ -80,10 +82,10 @@
 +    kb_per = triton.cdiv(n_kb, split_k)
 +    part = torch.empty((split_k, M, N), dtype=torch.float32, device=a.device)
 +    _gemv_splitk_m_kernel[(n_tiles, split_k)](
-+        a, weight, part, N, K, n_kb, kb_per,
++        a, weight, part, N, K, M, n_kb, kb_per,
 +        a.stride(0), a.stride(1), weight.stride(0), weight.stride(1),
 +        part.stride(0), part.stride(1), part.stride(2),
-+        M_TILE=M, BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K, num_warps=1,
++        M_TILE=(1 << (M - 1).bit_length()), BLOCK_N=BLOCK_N, BLOCK_K=BLOCK_K, num_warps=1,
 +    )
 +    compute = out_dtype if out_dtype in _TL_DTYPE else torch.bfloat16
 +    out = torch.empty((M, N), dtype=compute, device=a.device)
@@ -99,7 +101,7 @@
  # Prefill (M>1) W8A16 GEMM: fp8 weight read from HBM, upcast to bf16 in-register for the
  # tensor-core dot (fp8 e4m3 -> bf16 is lossless), per-row scale applied after accumulation.
  # ======================================================================================
-@@ -275,6 +367,11 @@
+@@ -275,6 +369,11 @@
          ).reshape(*lead, N)
      elif x.numel() // K == 1:
          out = _gemv(x.reshape(K), e4m3_kernel_view(weight), weight_scale, x.dtype).reshape(*lead, N)

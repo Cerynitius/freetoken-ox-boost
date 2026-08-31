@@ -1,6 +1,14 @@
 --- a/python/freetoken/layers/moe.py
 +++ b/python/freetoken/layers/moe.py
-@@ -194,6 +194,24 @@
+@@ -149,6 +149,7 @@
+         hidden_states: torch.Tensor,
+         topk_weights: torch.Tensor,
+         topk_ids: torch.Tensor,
++        overlap_fn=None,
+     ) -> torch.Tensor:
+         """Expert compute for an externally computed routing decision (``TopK``).
+ 
+@@ -194,6 +195,30 @@
          return self._maybe_all_reduce(final_hidden_states)
  
  
@@ -18,6 +26,12 @@
 +_SPEC_BLOCK_OF: dict = {}  # id(OffloadMoELayer) -> its sparse block (cycle-free)
 +_SPEC_PREFETCH = int(os.environ.get("FREETOKEN_MOE_SPEC_PREFETCH", "0") or 0)
 +
++# Overlap the decode miss-fetch (UVA gather kernel) with caller-provided compute on a
++# side stream: the copy kernel is latency/DMA-bound and uses few SMs, so e.g. the shared
++# expert GEMV runs concurrently instead of serially behind it. fork(join) pattern is
++# CUDA-graph-capture safe (the side stream's work becomes ordinary graph nodes).
++_COPY_OVERLAP = os.getenv("FREETOKEN_MOE_COPY_OVERLAP", "0") == "1"
++
 +# Short-prefill on-demand fetch threshold (tokens); 0 disables (always stream).
 +_PREFILL_ONDEMAND_TOKENS = int(os.environ.get("FREETOKEN_PREFILL_ONDEMAND_TOKENS", "48") or 0)
 +
@@ -25,7 +39,15 @@
  class OffloadMoELayer(MoELayer):
      def __init__(
          self,
-@@ -245,6 +263,21 @@
+@@ -236,6 +261,7 @@
+         hidden_states: torch.Tensor,
+         topk_weights: torch.Tensor,
+         topk_ids: torch.Tensor,
++        overlap_fn=None,
+     ) -> torch.Tensor:
+         """Expert compute for an externally computed routing decision (``TopK``).
+ 
+@@ -245,16 +271,32 @@
          rewrites expert ids into cache slot ids); pass a fresh tensor or a clone.
          """
          ctx = get_global_ctx()
@@ -47,7 +69,36 @@
          if ctx.batch.is_prefill:
              out = self._prefill_routed(hidden_states, topk_weights, topk_ids)
          else:
-@@ -307,11 +340,50 @@
+-            out = self._decode_routed(hidden_states, topk_weights, topk_ids)
++            out = self._decode_routed(hidden_states, topk_weights, topk_ids, overlap_fn=overlap_fn)
+         return self._maybe_all_reduce(out)
+ 
+     def decode_forward(
+         self,
+         hidden_states: torch.Tensor,
+         router_logits: torch.Tensor | None = None,
++            overlap_fn=None,
+     ):
+         topk_weights, topk_ids = fused_topk(
+             hidden_states=hidden_states,
+@@ -262,7 +304,7 @@
+             topk=self.top_k,
+             renormalize=self.renormalize,
+         )
+-        return self._decode_routed(hidden_states, topk_weights, topk_ids)
++        return self._decode_routed(hidden_states, topk_weights, topk_ids, overlap_fn=overlap_fn)
+ 
+     def prefill_forward(
+         self,
+@@ -290,6 +332,7 @@
+         hidden_states: torch.Tensor,
+         topk_weights: torch.Tensor,
+         topk_ids: torch.Tensor,
++            overlap_fn=None,
+     ) -> torch.Tensor:
+         """On-demand load: ``ensure_experts`` rewrites ``topk_ids`` into cache slot
+         ids in place (loading missing experts), then the GEMM reads the full slot
+@@ -307,11 +350,64 @@
              executor = cache.cpu_executor
              assert executor is not None, "CPU MoE executor was not initialized"
              return executor.decode(self.layer_id, hidden_states, topk_weights, topk_ids)
@@ -92,15 +143,30 @@
 +                pf.launch(self.layer_id, hidden_states)
 +            return out
          cache.ensure_experts(self.layer_id, topk_ids)
-         cache.copy_missing()
+-        cache.copy_missing()
 -        return self._expert_gemm(
++        if _COPY_OVERLAP and overlap_fn is not None:
++            cs = getattr(cache, "_copy_overlap_stream", None)
++            if cs is None:
++                cs = cache._copy_overlap_stream = torch.cuda.Stream(
++                    device=hidden_states.device)
++            cur = torch.cuda.current_stream()
++            cs.wait_stream(cur)          # slot assignment/evict must be visible first
++            with torch.cuda.stream(cs):
++                cache.copy_missing()     # UVA gather rides the side stream
++            overlap_fn()                 # e.g. shared-expert GEMV, concurrent on main
++            cur.wait_stream(cs)          # join before the GEMM reads fetched rows
++        else:
++            cache.copy_missing()
++            if overlap_fn is not None:
++                overlap_fn()
 +        if pf is not None:
 +            pf.before_gemm(self.layer_id)  # prefetched data for THIS layer must have landed
 +        out = self._expert_gemm(
              cache,
              hidden_states,
              topk_weights,
-@@ -321,7 +393,29 @@
+@@ -321,7 +417,29 @@
              alphas=cache.alphas_for_slots(self.layer_id),
              is_prefill=False,
          )
@@ -130,7 +196,7 @@
      def _decode_hybrid(
          self,
          cache: OffloadMoeCache,
-@@ -380,9 +474,65 @@
+@@ -380,9 +498,65 @@
          """Prefill movement: stream whole layers -- double-buffered behind the
          previous layer's GEMMs when ``prefill_overlap`` is on, else a synchronous
          ``materialize_layer``. In both, position == expert id, so the routing ids

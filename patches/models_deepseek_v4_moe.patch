@@ -67,7 +67,7 @@
          cache.ensure_experts(self.layer_id, topk_ids)  # in-place expert-id -> slot
          cache.copy_missing()
          if cache.collect_stats:
-@@ -129,6 +160,11 @@
+@@ -129,18 +160,42 @@
          self.gate = Gate(layer_id, args)
          self.shared_experts = Expert(args.dim, args.moe_inter_dim, args.swiglu_limit)
          self.experts = DSV4OffloadMoELayer(layer_id, args)
@@ -79,9 +79,25 @@
  
      def forward(self, x: torch.Tensor, input_ids: torch.Tensor) -> torch.Tensor:
          shape = x.size()
-@@ -144,3 +180,21 @@
-             x, weights.float().contiguous(), indices.to(torch.int32).contiguous()
+         x = x.view(-1, self.dim)
+         weights, indices = self.gate(x, input_ids.flatten())
+-        # Shared expert enqueued before routed_forward: hybrid decode blocks on the
+-        # CPU pool inside routed_forward, so this GEMM must already be on the stream
+-        # to overlap the CPU overflow compute.
+-        shared = self.shared_experts(x)
+-        # routed_forward may mutate the ids in place (offload decode slot remap);
+-        # indices.to(int32) always copies (int64 source), so no clone needed here.
++        # Shared expert placement: under FREETOKEN_MOE_COPY_OVERLAP the routed layer
++        # invokes it via overlap_fn WHILE the miss-fetch gather runs on a side stream
++        # (compute hidden behind PCIe); otherwise enqueue it up front as before (the
++        # hybrid-CPU overlap rationale).
++        shared_box: list = []
+         routed = self.experts.routed_forward(
+-            x, weights.float().contiguous(), indices.to(torch.int32).contiguous()
++            x, weights.float().contiguous(), indices.to(torch.int32).contiguous(),
++            overlap_fn=lambda: shared_box.append(self.shared_experts(x)),
          )
++        shared = shared_box[0] if shared_box else self.shared_experts(x)
          return (routed + shared).view(shape)
 +
 +    def spec_predict_scores(self, hidden: torch.Tensor):

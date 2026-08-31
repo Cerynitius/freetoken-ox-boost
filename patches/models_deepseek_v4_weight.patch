@@ -1,0 +1,47 @@
+--- a/python/freetoken/models/deepseek_v4/weight.py
++++ b/python/freetoken/models/deepseek_v4/weight.py
+@@ -16,6 +16,8 @@
+ from typing import Iterator
+ 
+ import safetensors
++import os as _os
++
+ import torch
+ from tqdm import tqdm
+ 
+@@ -107,7 +109,14 @@
+     try:
+         yield "embed.weight", get("embed.weight")
+         yield "norm.weight", get("norm.weight")
+-        yield "head", get("head.weight")
++        if _os.environ.get("FREETOKEN_DSV4_HEAD_FP8", "0") == "1":
++            from freetoken.models.glm_moe_dsa.weight import _quant_fp8_per_row
++
++            hq, hs = _quant_fp8_per_row(get("head.weight"))
++            yield "head", hq
++            yield "head_scale", hs
++        else:
++            yield "head", get("head.weight")
+         for nm in ("hc_head_fn", "hc_head_base", "hc_head_scale"):
+             yield nm, get(nm)
+ 
+@@ -118,10 +127,15 @@
+             yield from linear(f"{a}.wq_b")
+             yield from linear(f"{a}.wkv")
+             yield f"{a}.kv_norm.weight", get(f"{a}.kv_norm.weight")
+-            # wo_a: FP8 in the checkpoint, dequantized to bf16 (reference bf16 einsum).
+-            yield f"{a}.wo_a", _dequant_fp8_block(
+-                get(f"{a}.wo_a.weight"), get(f"{a}.wo_a.scale")
+-            )
++            if _os.environ.get("FREETOKEN_DSV4_WOA_FP8", "0") == "1":
++                # native FP8 + e8m0 codes; decode runs the grouped FP8 GEMV
++                yield f"{a}.wo_a_q", get(f"{a}.wo_a.weight")
++                yield f"{a}.wo_a_s", get(f"{a}.wo_a.scale").view(torch.uint8)
++            else:
++                # wo_a: FP8 in the checkpoint, dequantized to bf16 (reference bf16 einsum).
++                yield f"{a}.wo_a", _dequant_fp8_block(
++                    get(f"{a}.wo_a.weight"), get(f"{a}.wo_a.scale")
++                )
+             yield from linear(f"{a}.wo_b")
+             yield f"{a}.attn_sink", get(f"{a}.attn_sink")
+ 
