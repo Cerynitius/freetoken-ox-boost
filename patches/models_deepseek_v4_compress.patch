@@ -20,7 +20,7 @@
  
  
  class Compressor(nn.Module):
-@@ -291,9 +295,83 @@
+@@ -291,9 +295,88 @@
          )
          return reduced
  
@@ -76,8 +76,13 @@
 +            fp4_act_quant_inplace(compressed, 32)
 +        else:
 +            act_quant_fp8_inplace(compressed[..., :-rd], 64)
-+        cmp_dst = self.attn.decode_compress_rows(
-+            rows, pos, ratio, self.layer_id, self.tier, should_all
++        row_of_block = dctx_get(dctx, ("blockrow", ratio),
++                                lambda: self.attn.pool.cmp_rows(
++                                    self.attn.snapshot()[rows, pos.long()], ratio))
++        cmp_dst = torch.where(
++            should_all,
++            row_of_block,
++            rows + self.attn.compress_scratch_base(self.layer_id, self.tier),
 +        )
 +        self.attn.scatter_compressed(self.layer_id, self.tier, cmp_dst, compressed)
 +
@@ -105,7 +110,7 @@
      ) -> None:
          """Batched single-token compressor update (EAGER/graph; ``pos``/``prev_window_slots``/
          ``window_slots`` are GPU int tensors ``[B]``; ``rows`` is the LOCAL row index [B] into the
-@@ -306,41 +384,69 @@
+@@ -306,44 +389,78 @@
          -> disjoint ring blocks, so co-tenant rows never contaminate each other."""
          assert self.cmp_pool is not None
          B = x.size(0)
@@ -156,8 +161,13 @@
 +            from freetoken.kernel.triton.dsv4.comp_step import fused_comp_step
 +
 +            ring = self.attn.compress_state_ring(self.layer_id, self.tier)
-+            prev_base = self.attn.ring_page_base(prev_window_slots, self.ring_size)
-+            cur_base = self.attn.ring_page_base(window_slots, self.ring_size)
++            # ring block bases are LAYER-INVARIANT per ring_size (slots are shared):
++            # memoized, so the int64 div/mul pair runs twice per step, not 124 times
++            rs = self.ring_size
++            prev_base = dctx_get(dctx, ("rbase_p", rs),
++                                 lambda: self.attn.ring_page_base(prev_window_slots, rs))
++            cur_base = dctx_get(dctx, ("rbase_c", rs),
++                                lambda: self.attn.ring_page_base(window_slots, rs))
 +            pooled = fused_comp_step(
 +                ring.buffer, kvs[:, :item], kvs[:, item:], self.ape,
 +                prev_base, cur_base, idx_mod, should.view(B),
@@ -204,8 +214,13 @@
 +            )
  
          compressed = self.norm(compressed)
-         freqs_t = self.freqs_cis.index_select(0, (pos + 1 - ratio).clamp_min(0))  # [B, rd//2]
-@@ -425,10 +531,13 @@
+-        freqs_t = self.freqs_cis.index_select(0, (pos + 1 - ratio).clamp_min(0))  # [B, rd//2]
++        freqs_t = dctx_get(dctx, ("cmp_freqs", id(self.freqs_cis), ratio),
++                           lambda: self.freqs_cis.index_select(0, (pos + 1 - ratio).clamp_min(0)))
+         apply_rotary_emb_decode(compressed[..., -rd:], freqs_t)
+         if self.rotate:
+             compressed = hadamard_transform(compressed)
+@@ -425,10 +542,13 @@
              topk=self.index_topk, offset=offset,
          )
  
@@ -221,7 +236,7 @@
          bsz, seqlen, _ = x.size()
          end = start_pos + seqlen
          freqs_cis = self.freqs_cis[start_pos:end]
-@@ -437,7 +546,10 @@
+@@ -437,7 +557,10 @@
          apply_rotary_emb(q[..., -rd:], freqs_cis)
          q = hadamard_transform(q)
          fp4_act_quant_inplace(q, 32)
@@ -233,7 +248,7 @@
          weights = self.weights_proj(x) * (self.softmax_scale * self.n_heads ** -0.5)
          keys = self.attn.indexer_keys(ti, end // ratio, ratio, self.layer_id, bsz)
          scores = self.attn.indexer_prefill_logits(q, keys, weights)
-@@ -449,7 +561,7 @@
+@@ -449,7 +572,7 @@
      def decode_step(
          self, x: torch.Tensor, qr: torch.Tensor, pos: torch.Tensor, offset: int,
          prev_window_slots: torch.Tensor, window_slots: torch.Tensor, rows: torch.Tensor,
@@ -242,7 +257,7 @@
      ) -> torch.Tensor:
          """Batched single-token indexer (EAGER/graph). Scores the first ``n_stage`` compressed
          indexer blocks per row (gathered PER ROW from the paged idx_pool), masks blocks beyond
-@@ -461,13 +573,15 @@
+@@ -461,13 +584,15 @@
          B = x.size(0)
          ratio, rd = self.compress_ratio, self.rope_head_dim
          q = self.wq_b(qr).unflatten(-1, (self.n_heads, self.head_dim))

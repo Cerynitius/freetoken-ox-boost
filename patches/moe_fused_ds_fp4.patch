@@ -31,7 +31,19 @@
      assert (K // 2) % BLOCK_SIZE_KB == 0, (K, BLOCK_SIZE_KB)
      grid = (total_routes, triton.cdiv(N, BLOCK_SIZE_N))
      _decode_dsfp4_moe_kernel[grid](
-@@ -210,10 +221,24 @@
+@@ -121,10 +132,9 @@
+         x, gate_up_packed, gate_up_scale, slots, None,
+         a_row_is_route=False, mul_routed_weight=False,
+     )  # [T, top_k, 2I]
+-    act = fused_swiglu(gate_up, swiglu_limit)  # [T, top_k, I]
++    act = fused_swiglu(gate_up, swiglu_limit, quant=True)  # [T, top_k, I] + FP8 rt
+ 
+     act = act.reshape(T * top_k, I)
+-    act_quant_fp8_inplace(act, 128)  # down activation -> FP8 round-trip
+     down = _grouped_decode(
+         act, down_packed, down_scale, slots, topk_weights,
+         a_row_is_route=True, mul_routed_weight=True,
+@@ -210,10 +220,24 @@
      # One static config for every density (no autotune): the kernel is
      # dequant-floor-bound, so per-expert padding at BLOCK_M=64 costs the same
      # as tighter tiles while keeping the wgmma-wide M tile on sm_90.

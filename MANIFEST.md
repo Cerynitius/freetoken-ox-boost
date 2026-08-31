@@ -140,3 +140,13 @@ Same verdict class as the GLM MTP attempt (-13%). Kept env-gated OFF.
 | Fused compressor decode step (register roll: read/scatter/pool/promote/write in ONE launch x 62 tier-instances, ape in-kernel; ratio-128 pool row-TILED -- the first cut's serial 128-load chain cost 52 us/launch) | +1.1 then +2.3 more once tiled (55 -> 56 -> 60.4, quality 15/15, conc2 84.4) | `overlay: kernel/triton/dsv4/comp_step.py` + `patches: models_deepseek_v4_compress` | `FREETOKEN_DSV4_FUSED_COMP` (1) |
 | sqrtsoftplus fused route (softplus/sqrt/+bias/topk/gather/renorm/scale, ~8 launches -> 1 x 40 layers; stable softplus form) | +2.2 tok/s (56 -> 58.1), quality 15/15 | `overlay: kernel/triton/fused_route.py` (ACT constexpr) + `patches: models_deepseek_v4_moe` | `FREETOKEN_FUSED_ROUTE` (1) |
 | memory-ratio 0.95 + cache 6200 | no gain (hit already 97.6%) | -- | rejected |
+| Layer-invariant decode addressing memoized (ring block bases, compressed-block rows, compressor freqs -- ~370 int64 kernels/step -> ~10) | +1.6 tok/s (60.4 -> 62) | `patches: models_deepseek_v4_compress` | none (dctx memo) |
+| mHC pre-mix: rms folded into the mix GEMV (bf16 read, redundant per-program ssq; kills the rms_cast launch + fp32 intermediate). A one-CTA full fusion was tried first and DESTROYED parallelism (39 tok/s) -- parallel grid shape is the point | +1.9 tok/s (62 -> 64) | `overlay: kernel/triton/dsv4/hc_fused.py` + `patches: models_deepseek_v4_model` | `FREETOKEN_DSV4_HC_FUSED` (1) |
+| swiglu + down-side FP8 round-trip fused (QUANT constexpr in the swiglu kernel) | ~0 measured (sub-noise), kernel count -80/step | `patches: kernel_triton_dsv4_fused_moe / moe_fused_ds_fp4` | none |
+| fp8 GEMV Blackwell config sweep | big shapes already at 98% of GDDR7 peak (1.77 TB/s); no config wins | -- | rejected |
+
+Final (2026-09-01): single 64.1 (+16.5% over the round-2 55), conc2 87.5, conc4 128.6,
+conc8 167.2, quality 15/15. Measurement discipline: a fresh boot underreports by up
+to 6 tok/s for the first 1-2 matrix passes (expert-cache convergence) -- always run
+the matrix twice and read the second pass. The one-CTA hc fusion and an early serial
+128-row pool loop were both caught by this only after a false negative/positive each.

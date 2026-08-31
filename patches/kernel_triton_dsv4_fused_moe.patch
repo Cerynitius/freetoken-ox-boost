@@ -1,0 +1,56 @@
+--- a/python/freetoken/kernel/triton/dsv4/fused_moe.py
++++ b/python/freetoken/kernel/triton/dsv4/fused_moe.py
+@@ -117,6 +117,9 @@
+     tl.store(c_ptrs, accumulator.to(compute_type), mask=(route_id < total_routes) & n_mask)
+ 
+ 
++from freetoken.kernel.triton.dsv4.fp8_linear import _log2_ceil as _q_log2_ceil
++
++
+ @triton.jit
+ def _swiglu_kernel(
+     gu_ptr,            # [R, 2I] gate_up (compute dtype)
+@@ -124,6 +127,7 @@
+     R, I, limit,
+     stride_gr, stride_gi, stride_or, stride_oi,
+     BLOCK: tl.constexpr, HAS_LIMIT: tl.constexpr, compute_type: tl.constexpr,
++    QUANT: tl.constexpr,
+ ):
+     """Fused SwiGLU: ``out = silu(min(gate, limit)) * clamp(up, -limit, limit)``.
+ 
+@@ -139,6 +143,17 @@
+         g = tl.minimum(g, limit)
+         u = tl.minimum(tl.maximum(u, -limit), limit)
+     act = (g * tl.sigmoid(g)) * u
++    if QUANT:
++        # fold the down-side FP8 round-trip (block 128) into the store: amax per
++        # 128-chunk -> ue8m0 scale -> e4m3 cast -> dequant (same math as
++        # _act_quant_inplace_kernel with FP8_MAX=448)
++        a2 = tl.reshape(act, (BLOCK // 128, 128))
++        amax = tl.maximum(tl.max(tl.abs(a2), axis=1), 1e-4)
++        e = _q_log2_ceil(amax * (1.0 / 448.0))
++        sc = tl.exp2(e.to(tl.float32))
++        q = tl.clamp(a2 / sc[:, None], -448.0, 448.0)
++        q = q.to(tl.float8e4nv).to(tl.float32)
++        act = tl.reshape(q * sc[:, None], (BLOCK,))
+     tl.store(out_ptr + row * stride_or + offs * stride_oi, act.to(compute_type), mask=mask)
+ 
+ 
+@@ -274,7 +289,7 @@
+     return {torch.bfloat16: tl.bfloat16, torch.float16: tl.float16, torch.float32: tl.float32}[dtype]
+ 
+ 
+-def fused_swiglu(gate_up: torch.Tensor, limit: float) -> torch.Tensor:
++def fused_swiglu(gate_up: torch.Tensor, limit: float, quant: bool = False) -> torch.Tensor:
+     """``[..., 2I] -> [..., I]`` SwiGLU in a single kernel (see ``_swiglu_kernel``)."""
+     *lead, two_I = gate_up.shape
+     I = two_I // 2
+@@ -286,7 +301,7 @@
+     _swiglu_kernel[grid](
+         gu, out, R, I, float(limit),
+         gu.stride(0), gu.stride(1), out.stride(0), out.stride(1),
+-        BLOCK=BLOCK, HAS_LIMIT=limit > 0,
++        BLOCK=BLOCK, HAS_LIMIT=limit > 0, QUANT=quant,
+         compute_type=_compute_type(gate_up.dtype), num_warps=4,
+     )
+     return out.reshape(*lead, I)

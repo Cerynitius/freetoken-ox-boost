@@ -17,10 +17,22 @@
  from freetoken.models.blocks import BaseLLMModel
  
  from .args import DeepseekV4Args
-@@ -72,15 +75,18 @@
+@@ -72,15 +75,30 @@
          self.hc_ffn_scale = nn.Parameter(torch.empty(3, dtype=torch.float32), requires_grad=False)
  
      def hc_pre(self, x, hc_fn, hc_scale, hc_base):
++        shape0 = x.shape
++        M0 = shape0[0] * shape0[1]
++        if M0 <= 16 and os.environ.get("FREETOKEN_DSV4_HC_FUSED", "1") == "1":
++            # decode: the whole pre-mix (rms + MIX dots + sinkhorn + combine) in ONE launch
++            from freetoken.kernel.triton.dsv4.hc_fused import hc_pre_fused
++
++            y, post, comb = hc_pre_fused(
++                x.reshape(M0, self.hc_mult, self.dim), hc_fn, hc_scale, hc_base,
++                self.norm_eps, self.hc_eps, self.hc_sinkhorn_iters, x.dtype,
++            )
++            return (y.view(*shape0[:2], self.dim), post,
++                    comb.view(M0, self.hc_mult, self.hc_mult))
 +        # tail-fusion (ported from glm5_next 2026-08-29): cast+square+mean+rsqrt -> one
 +        # kernel; gemv with rsqrt epilogue -> one kernel; pre_combine upcasts bf16
 +        # in-register (the eager chain was ~7 launches + two fp32 casts per call).
@@ -42,7 +54,7 @@
          return y, post.view(M, self.hc_mult), comb.view(M, self.hc_mult, self.hc_mult)
  
      def hc_post(self, x, residual, post, comb):
-@@ -112,11 +118,11 @@
+@@ -112,11 +130,11 @@
          x = self.hc_post(x, residual, post, comb)
          return x
  
@@ -56,7 +68,7 @@
          x = self.hc_post(x, residual, post, comb)
  
          residual = x
-@@ -138,7 +144,18 @@
+@@ -138,7 +156,18 @@
          self.embed.weight.requires_grad_(False)
          self.layers = nn.ModuleList([Block(i, args) for i in range(args.n_layers)])
          self.norm = RMSNorm(args.dim, self.norm_eps)
@@ -76,7 +88,7 @@
          hc_dim = hc_mult * args.dim
          self.hc_head_fn = nn.Parameter(torch.empty(hc_mult, hc_dim, dtype=torch.float32), requires_grad=False)
          self.hc_head_base = nn.Parameter(torch.empty(hc_mult, dtype=torch.float32), requires_grad=False)
-@@ -151,12 +168,12 @@
+@@ -151,12 +180,12 @@
      def hc_head(self, x):
          shape, dtype = x.size(), x.dtype
          dim = self.args.dim
@@ -94,7 +106,7 @@
  
      def prefill_batched(
          self, input_ids: torch.Tensor, segments, flat_positions: torch.Tensor,
-@@ -174,10 +191,27 @@
+@@ -174,10 +203,27 @@
          # final token -> its next-token logits row.
          h = self.embed(input_ids)
          h = h.unsqueeze(2).repeat(1, 1, self.hc_mult, 1)
@@ -123,7 +135,7 @@
          return F.linear(h[0, last_indices], self.head)  # [B, vocab]
  
      def decode(
-@@ -202,10 +236,22 @@
+@@ -202,10 +248,22 @@
          # into every layer. They read only the shared snapshot / positions, so they are identical
          # across layers.
          wctx = get_global_ctx().batch.attn_metadata.window_ctx(pos, rows)
@@ -148,7 +160,7 @@
          return F.linear(h[:, -1], self.head)
  
  
-@@ -260,6 +306,10 @@
+@@ -260,6 +318,10 @@
          if state_dict and not _internal:
              raise RuntimeError(f"Unexpected keys in state_dict: {list(state_dict.keys())}")
          self._transformer.load_state_dict(casted, assign=True, strict=False)
