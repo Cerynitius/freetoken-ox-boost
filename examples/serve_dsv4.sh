@@ -63,7 +63,9 @@ export FREETOKEN_DSV4_HEAD_FP8=${FREETOKEN_DSV4_HEAD_FP8:-1}
 
 MODEL=/home/zrx/dsv4-stack/weights/DSV4-Flash-0731-CRACK
 PORT="${DSV4_PORT:-1920}"
-CTX=98304
+CTX=98304  # legacy; superseded by the two knobs below
+KV_RESERVE="${DSV4_KV_RESERVE:-1048576}"   # total pooled KV tokens (all streams)
+MAX_SEQ="${DSV4_MAX_SEQ:-524288}"         # per-request context cap
 
 # ---- preconditions: FreeToken has no guard for any of these and fails late/opaquely ----
 # 1. --moe-cache-auto sizes from LIVE free VRAM (engine.py:316-319). If another engine holds
@@ -105,7 +107,7 @@ exec /home/zrx/miniconda3/envs/freetoken/bin/ft serve \
   --moe-backend offload \
   $([ -n "${DSV4_MOE_CACHE:-}" ] && echo "--moe-cache-size $DSV4_MOE_CACHE" || echo --moe-cache-auto) \
   --moe-prefill-hit-d2d \
-  --memory-ratio ${DSV4_MEM_RATIO:-0.92} \
-  --kv-reserve-tokens "$CTX" \
-  --max-seq-len-override "$CTX" \
-  --max-running-requests ${DSV4_MAX_RUNNING:-12}
+  --memory-ratio ${DSV4_MEM_RATIO:-0.95} \
+  --kv-reserve-tokens "$KV_RESERVE" \
+  --max-seq-len-override "$MAX_SEQ" \
+  --max-running-requests ${DSV4_MAX_RUNNING:-2}
