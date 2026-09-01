@@ -156,3 +156,23 @@ codegen / long-gen / deep-context retrieval / concurrency): zero failures outsid
 one pre-existing model mode (rare adjacent-function retrieval flip on greedy
 near-ties in 60-150-function synthetic modules; present at the same order in BOTH
 numerics arms, replay-correct). Tonight's kernels are behaviorally clean.
+
+### Deep-context stabilization (2026-09-02)
+
+The 384K-pool config crashed on every cold prefill past ~100K: four distinct OOM
+classes, all transient-peak collisions against the free-VRAM margin. Fixes, all
+default-on:
+
+| Fix | Files | Switch |
+|---|---|---|
+| Prefill chunk budget clamp (window-derived budget inflated to ~39K-token chunks on large KV pools; hc fp32 intermediates then need GBs) | `patches: scheduler_cache` | `FREETOKEN_PREFILL_CHUNK_CAP` (4096) |
+| Row-sliced indexer causal top-k (the old path materialized [chunk, n_blocks] int64+fp32 temporaries -- 2 GiB+ at 131K depth) | `patches: attention_dsv4_indexer` | none |
+| Persistent on-demand prefill staging, budgeted into --moe-cache-auto (per-call ~3 GB slab allocation was the recurring OOM site; now a boot-time slab, worst-case num_experts rows) | `patches: layers_moe / moe_offload_cache / engine_engine` | follows `FREETOKEN_PREFILL_ONDEMAND_TOKENS` |
+| expandable_segments allocator + allocator watermark in the decode telemetry | `examples/serve_dsv4.sh` + `patches: scheduler_status` | env in serve script |
+
+Validated: 60K/131K/196K/236K cold prefills all survive (3 consecutive full runs);
+retention experiment flat at 90.9G across repeated deep requests (no leak); shallow
+regression clean (single ~57-58 after the ~256-expert staging trade, conc2 ~80,
+quality 14/15, TTFT unchanged). Depth decay itself is mild: decode 54-57 at
+131K-236K vs ~58-60 empty -- the scary early "-19%" readings were the cold-boot
+cache-convergence artifact.

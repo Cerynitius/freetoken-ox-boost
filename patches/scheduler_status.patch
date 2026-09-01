@@ -1,10 +1,15 @@
 --- a/python/freetoken/scheduler/status.py
 +++ b/python/freetoken/scheduler/status.py
-@@ -112,8 +112,30 @@
+@@ -112,8 +112,35 @@
          self._last_decode_time = now
          gen_throughput = self._decode_generated_tokens / gap if gap > 0 else 0.0
          self._decode_generated_tokens = 0
 +        moe = ""
++        try:
++            import torch as _t
++            moe = f"alloc: {_t.cuda.memory_allocated() / (1 << 30):.2f}G, "
++        except Exception:
++            pass
 +        try:  # armed only under --moe-collect-stats; never let stats break serving
 +            from freetoken.core import get_global_ctx
 +

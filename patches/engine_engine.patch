@@ -32,7 +32,18 @@
  
          post_free_memory = self._sync_get_memory()[0]
          logger.info_rank0(f"Free memory after initialization: {mem_GB(post_free_memory)}")
-@@ -627,7 +652,13 @@
+@@ -479,6 +504,10 @@
+         cache_per_page, fixed_cache_size, page_tokens, min_reserve = self._pool_cls.kv_cost(config)
+         fixed_cache_size += state_pool_bytes(config)  # sibling GDN state pool, engine-summed
+         num_experts = config.model_config.num_experts
++        if int(os.environ.get("FREETOKEN_PREFILL_ONDEMAND_TOKENS", "48") or 0) > 0:
++            # persistent on-demand prefill staging (worst case: every expert of a layer),
++            # allocated in set_bank_sources -- must come out of the same budget
++            fixed_cache_size += expert_bytes_per_slot(banks.sources) * num_experts
+         total_experts = config.model_config.num_moe_layers * num_experts
+         return resolve_moe_cache_auto(
+             baseline_free=self._baseline_free,
+@@ -627,7 +656,13 @@
              self._resolve_hybrid_fetch(config, cache)
          # Must be set before CUDA graph capture so the (device-side) accumulation ops are
          # captured and re-run on every decode replay.
@@ -47,7 +58,7 @@
          # attach_offload_moe_cache walks for OffloadMoELayers, or defers to a model's
          # _iter_offload_moe_layers() hook when its MoE blocks are bespoke nn.Modules (DSV4).
          layers = attach_offload_moe_cache(self.model, cache)
-@@ -912,8 +943,36 @@
+@@ -912,8 +947,36 @@
              moe_offload_cache=self.moe_offload_cache,
          )
  
@@ -84,7 +95,7 @@
          with self.ctx.forward_batch(batch):
              if self.graph_runner.can_use_cuda_graph(batch):
                  logits = self.graph_runner.replay(batch)
-@@ -929,6 +988,8 @@
+@@ -929,6 +992,8 @@
  
          batch_logits = logits[: batch.size]
          next_tokens_gpu = self.sampler.sample(batch_logits, args).to(torch.int32)

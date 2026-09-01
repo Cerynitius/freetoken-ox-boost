@@ -1,0 +1,29 @@
+--- a/python/freetoken/attention/dsv4_indexer.py
++++ b/python/freetoken/attention/dsv4_indexer.py
+@@ -67,11 +67,21 @@
+         """
+         device = scores.device
+         n_blocks = scores.shape[-1]
+-        live = ((start_pos + torch.arange(1, seqlen + 1, device=device)) // ratio).unsqueeze(1)
+-        blk = torch.arange(n_blocks, device=device).repeat(seqlen, 1)
+-        scores = scores + torch.where(blk >= live, float("-inf"), 0)
+-        picks = scores.topk(min(topk, n_blocks), dim=-1)[1]
+-        return torch.where(picks >= live, -1, picks + offset)
++        live = (start_pos + torch.arange(1, seqlen + 1, device=device)) // ratio
++        blk = torch.arange(n_blocks, device=device)
++        # Row-sliced causal mask + top-k: the old path materialized a [seqlen, n_blocks]
++        # int64 arange (2 GiB at an 8K chunk against a 131K-deep prefix) plus two fp32
++        # copies of the same shape, which OOMed deep prefills. Rows are independent, so
++        # slice; peak transient is one [slice, n_blocks] fp32.
++        SLICE = 1024
++        outs = []
++        for s0 in range(0, seqlen, SLICE):
++            sl = slice(s0, min(s0 + SLICE, seqlen))
++            live_s = live[sl].unsqueeze(1)
++            sc = scores[..., sl, :].masked_fill(blk >= live_s, float("-inf"))
++            picks = sc.topk(min(topk, n_blocks), dim=-1)[1]
++            outs.append(torch.where(picks >= live_s, -1, picks + offset))
++        return torch.cat(outs, dim=-2)
+ 
+     def indexer_select_decode(
+         self, scores: torch.Tensor, *, valid: torch.Tensor, topk: int, offset: int

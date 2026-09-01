@@ -89,6 +89,7 @@ fi
 [[ -f "$MODEL/inference/config.json" ]]        || { echo "FATAL: missing inference/config.json in $MODEL" >&2; exit 1; }
 echo "preconditions ok: VRAM used ${USED} MiB, MemAvailable ${AVAIL} GiB, checkpoint present"
 
+export PYTORCH_CUDA_ALLOC_CONF=${PYTORCH_CUDA_ALLOC_CONF:-expandable_segments:True}
 export FREETOKEN_PREFILL_ONDEMAND_TOKENS=${FREETOKEN_PREFILL_ONDEMAND_TOKENS:-512}
 # post-boot self-warmup: absorbs the first-request cold outlier (triton compiles, cold caches)
 (

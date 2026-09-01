@@ -8,7 +8,7 @@
      ) -> torch.Tensor:
          """Expert compute for an externally computed routing decision (``TopK``).
  
-@@ -194,6 +195,30 @@
+@@ -194,6 +195,31 @@
          return self._maybe_all_reduce(final_hidden_states)
  
  
@@ -34,12 +34,13 @@
 +
 +# Short-prefill on-demand fetch threshold (tokens); 0 disables (always stream).
 +_PREFILL_ONDEMAND_TOKENS = int(os.environ.get("FREETOKEN_PREFILL_ONDEMAND_TOKENS", "48") or 0)
++_ONDEMAND_MAX_DEPTH = int(os.environ.get("FREETOKEN_ONDEMAND_MAX_DEPTH", "32768"))
 +
 +
  class OffloadMoELayer(MoELayer):
      def __init__(
          self,
-@@ -236,6 +261,7 @@
+@@ -236,6 +262,7 @@
          hidden_states: torch.Tensor,
          topk_weights: torch.Tensor,
          topk_ids: torch.Tensor,
@@ -47,7 +48,7 @@
      ) -> torch.Tensor:
          """Expert compute for an externally computed routing decision (``TopK``).
  
-@@ -245,16 +271,32 @@
+@@ -245,16 +272,32 @@
          rewrites expert ids into cache slot ids); pass a fresh tensor or a clone.
          """
          ctx = get_global_ctx()
@@ -81,7 +82,7 @@
      ):
          topk_weights, topk_ids = fused_topk(
              hidden_states=hidden_states,
-@@ -262,7 +304,7 @@
+@@ -262,7 +305,7 @@
              topk=self.top_k,
              renormalize=self.renormalize,
          )
@@ -90,7 +91,7 @@
  
      def prefill_forward(
          self,
-@@ -290,6 +332,7 @@
+@@ -290,6 +333,7 @@
          hidden_states: torch.Tensor,
          topk_weights: torch.Tensor,
          topk_ids: torch.Tensor,
@@ -98,7 +99,7 @@
      ) -> torch.Tensor:
          """On-demand load: ``ensure_experts`` rewrites ``topk_ids`` into cache slot
          ids in place (loading missing experts), then the GEMM reads the full slot
-@@ -307,11 +350,64 @@
+@@ -307,11 +351,64 @@
              executor = cache.cpu_executor
              assert executor is not None, "CPU MoE executor was not initialized"
              return executor.decode(self.layer_id, hidden_states, topk_weights, topk_ids)
@@ -166,7 +167,7 @@
              cache,
              hidden_states,
              topk_weights,
-@@ -321,6 +417,28 @@
+@@ -321,6 +418,28 @@
              alphas=cache.alphas_for_slots(self.layer_id),
              is_prefill=False,
          )
@@ -195,7 +196,7 @@
  
      def _decode_hybrid(
          self,
-@@ -380,9 +498,65 @@
+@@ -380,9 +499,71 @@
          """Prefill movement: stream whole layers -- double-buffered behind the
          previous layer's GEMMs when ``prefill_overlap`` is on, else a synchronous
          ``materialize_layer``. In both, position == expert id, so the routing ids
@@ -210,6 +211,11 @@
 +        this path (begin_prefill is layer-driven), so the two paths cannot mix state."""
          cache = self.offload_cache
          assert cache is not None
++        # Depth guard: the on-demand gather allocates fresh per-expert slabs (up to
++        # ~230 experts x 12.6 MB). At shallow depth that rides inside the margin, but a
++        # deep-context tail chunk lands ON TOP of the deep-prefill transients (indexer
++        # scores, hc fp32) and OOMs the scheduler. Past the depth cap, stream instead:
++        # zero fresh allocation, ~1s slower TTFT only for deep extends.
 +        if (
 +            0 < _PREFILL_ONDEMAND_TOKENS
 +            and hidden_states.shape[0] <= _PREFILL_ONDEMAND_TOKENS
@@ -235,9 +241,10 @@
 +            nmiss = torch.tensor([mpos.numel()], dtype=torch.int64,
 +                                 device=topk_ids.device)
 +            views = []
-+            for per_layer, slab in cache.banks:
-+                tmp = torch.empty((u,) + slab.shape[1:], dtype=slab.dtype,
-+                                  device=slab.device)
++            for _bi, (per_layer, slab) in enumerate(cache.banks):
++                # persistent staging slice (see offload_cache.set_bank_sources): a
++                # per-call torch.empty here spiked ~3 GB and OOMed deep-context serving
++                tmp = cache._ondemand_staging[_bi][:u]
 +                if hpos.numel():
 +                    # torch index ops lack Float8 kernels; route through a byte view.
 +                    if tmp.dtype in (torch.float8_e4m3fn, torch.float8_e8m0fnu):
