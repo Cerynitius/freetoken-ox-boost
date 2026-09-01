@@ -150,3 +150,9 @@ conc8 167.2, quality 15/15. Measurement discipline: a fresh boot underreports by
 to 6 tok/s for the first 1-2 matrix passes (expert-cache convergence) -- always run
 the matrix twice and read the second pass. The one-CTA hc fusion and an early serial
 128-row pool loop were both caught by this only after a false negative/positive each.
+
+Validation (2026-09-01): 10.6K-check A/B soak (fusions on vs off, exec-verified
+codegen / long-gen / deep-context retrieval / concurrency): zero failures outside
+one pre-existing model mode (rare adjacent-function retrieval flip on greedy
+near-ties in 60-150-function synthetic modules; present at the same order in BOTH
+numerics arms, replay-correct). Tonight's kernels are behaviorally clean.
