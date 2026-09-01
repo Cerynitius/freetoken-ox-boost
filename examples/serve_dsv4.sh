@@ -64,7 +64,7 @@ export FREETOKEN_DSV4_HEAD_FP8=${FREETOKEN_DSV4_HEAD_FP8:-1}
 MODEL=/home/zrx/dsv4-stack/weights/DSV4-Flash-0731-CRACK
 PORT="${DSV4_PORT:-1920}"
 CTX=98304  # legacy; superseded by the two knobs below
-KV_RESERVE="${DSV4_KV_RESERVE:-524288}"   # total pooled KV tokens (all streams)
+KV_RESERVE="${DSV4_KV_RESERVE:-393216}"   # total pooled KV tokens (all streams)
 MAX_SEQ="${DSV4_MAX_SEQ:-262144}"         # per-request context cap
 
 # ---- preconditions: FreeToken has no guard for any of these and fails late/opaquely ----
