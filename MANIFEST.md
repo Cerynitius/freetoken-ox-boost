@@ -115,6 +115,16 @@ Multimodal robustness (2026-10-02):
 | Multimodal prompt longer than one prefill chunk raised in the scheduler and killed the backend (3840x2160 image; or two concurrent 1920x1080 images at chunk 4096). Now: wait for a full budget, refuse with `multimodal_prompt_too_long`, or prefill across chunks with per-chunk embedding rows. Also fixes the admission-undo path on caches without ping-pong slots | `patches: scheduler_prefill / scheduler_scheduler / scheduler_utils` | `FREETOKEN_MM_CHUNKED_PREFILL` (0; examples 1) |
 | Vision attention in query-row chunks sized to a memory budget (the fp32 score matrix of a 1920x1080 image needed 6.9 GB) | `overlay: models/glm5_next/vision.py` | `FREETOKEN_GLM5_VISION_ATTN_CHUNK` (0; examples 512) + `FREETOKEN_GLM5_VISION_ATTN_BUDGET_MB` (256) |
 
+Prefix cache and sparse attention (2026-10-02):
+
+| Change | Files | Switch |
+|---|---|---|
+| Text prompts keep their KDA track snapshot across prefill chunks and commit it, so repeated text prefixes hit the radix cache (an 8.6K-token prompt resent: 14.6 s -> 7.7 s). Like image hits, a hit can differ from a fresh prefill at bf16 ties | `patches: scheduler_prefill` | `FREETOKEN_TEXT_PREFIX_TRACK` (0; examples 1) |
+| DSA pooled index keys live at each pool's last-token row, always the request's own row when a prefix is shared | `patches: attention_dsa / kvcache_dsa_pool`; `overlay: kernel/triton/glm_dsa_glue.py` | none |
+| Sparse-attention P·V rounds P to TF32 to-nearest before the tensor-core dot (output bias vs fp64 -3.3e-4 -> -4.6e-6, same speed) | `patches: kernel_triton_glm_dsa_sparse` | `FREETOKEN_DSA_PV_PREC` (`tf32rna`; `tf32x3`), `FREETOKEN_DSA_PV_TF32=1` = truncating TF32 |
+| Router top-k never selects on NaN scores; image cache key covers the grid; the decode pool refresh reads only rows below the live length | `overlay: kernel/triton/fused_route.py, kernel/triton/glm_dsa_glue.py`; `patches: attention_dsa / scheduler_scheduler` | none |
+| Optional token-chunked vision tower for very large images (lower peak; not bit-identical to the unchunked path on GPU) | `overlay: models/glm5_next/vision.py` | `FREETOKEN_GLM5_VISION_TOKEN_BUDGET_MB` (0 = off) |
+
 ## Archived experiments (off by default; verdicts in commit history)
 
 | Experiment | Verdict | Switch |

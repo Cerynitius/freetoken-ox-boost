@@ -117,7 +117,7 @@
  
      @torch.inference_mode()
      def run_forever(self) -> NoReturn:
-@@ -486,6 +557,106 @@
+@@ -486,6 +557,122 @@
                      "Dropping request %d because its abort arrived before admission", msg.uid
                  )
                  return
@@ -158,12 +158,23 @@
 +                        arr = np.frombuffer(d["pix"], dtype=np.float32).copy()
 +                        pix_parts.append(arr.reshape(t * gh * gw, -1))
 +                        grids.append([t, gh, gw])
++                    _cuda = torch.cuda.is_available()
++                    if _cuda:  # host-side allocator stats only (no device sync)
++                        _alloc0 = torch.cuda.memory_allocated(self.device)
++                        torch.cuda.reset_peak_memory_stats(self.device)
 +                    msg.mm_embeds = model.encode_images(
 +                        torch.from_numpy(np.concatenate(pix_parts, axis=0)).to(
 +                            self.device, torch.bfloat16
 +                        ),
 +                        torch.tensor(grids, dtype=torch.long, device=self.device),
 +                    )
++                    if _cuda:
++                        # vision-encode transient high-water mark (VRAM headroom check)
++                        logger.info_rank0(
++                            "vision encode uid=%d patches=%d peak +%d MiB",
++                            msg.uid, sum(len(p) for p in pix_parts),
++                            (torch.cuda.max_memory_allocated(self.device) - _alloc0) >> 20,
++                        )
 +                    # Content-hash cache keys: fill each image's placeholder span with a
 +                    # per-image pixel hash (negative id range). Identical prefixes with the
 +                    # SAME image become prefix-cache hits; different images diverge at the
@@ -192,9 +203,14 @@
 +                        )
 +                        ri = 0
 +                        for d in msg.mm_images:
-+                            h = int.from_bytes(
-+                                hashlib.blake2b(d["pix"], digest_size=8).digest(), "big"
-+                            )
++                            # Key = (grid, pixels): the patch rows alone are ambiguous -- the
++                            # same bytes under a transposed / re-factored grid (e.g. a solid-color
++                            # 112x56 vs 56x112 image) are a different image to the tower (rope
++                            # positions, spatial merge), so they must not share a cache key.
++                            hb = hashlib.blake2b(digest_size=8)
++                            hb.update(np.asarray(d["grid"], dtype=np.int64).tobytes())
++                            hb.update(d["pix"])
++                            h = int.from_bytes(hb.digest(), "big")
 +                            hid = -(h % (2**31 - 2)) - 2
 +                            for _ in range(d["grid"][0]):
 +                                key_ids[runs[ri]] = hid
@@ -224,7 +240,7 @@
              input_len, max_seq_len = len(msg.input_ids), self.engine.max_seq_len
              max_output_len = max_seq_len - input_len
              if max_output_len <= 0:
-@@ -586,8 +757,28 @@
+@@ -586,8 +773,28 @@
          pool = self.engine.linear_state_pool
          if pool is None or not batch.is_prefill:
              return
@@ -253,7 +269,7 @@
                  pool.copy_from(req.mamba_restore_src, req.linear_slot_idx)
                  req.mamba_restore_src = None  # consumed: restore exactly once
  
-@@ -827,16 +1018,28 @@
+@@ -827,16 +1034,28 @@
  
      def _schedule_next_batch(self) -> ForwardInput | None:
          # TODO: support other policies: e.g. DECODE first

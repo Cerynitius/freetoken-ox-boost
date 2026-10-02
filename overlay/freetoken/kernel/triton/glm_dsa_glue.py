@@ -9,10 +9,11 @@ torch chains they replace, which stay in place for every other configuration:
   k-pool gate scores scattered at ``out_loc`` in one launch (was 3 ``index_put_`` + 4
   int32->int64 index casts per MLA layer).
 * ``dsa_pool_prologue`` -- ``_update_pools`` decode prologue: current-pool token ids,
-  validity, row gather, ``kcache[rg].float()``, ``where(valid, gcache[rg].float() + ape,
-  -inf)`` and the pool's first physical row (was ~20 tiny int/gather/cast kernels). The
-  softmax / product / sum / bf16 cast stay as the SAME torch ops on bit-identical
-  contiguous inputs.
+  validity, row gather (invalid lanes redirected to the pool's first token and their key
+  zeroed), ``kcache[rg].float()``, ``where(valid, gcache[rg].float() + ape, -inf)`` and the
+  pooled-key destination row = the newest token's row (was ~20 tiny int/gather/cast
+  kernels). The softmax / product / sum / bf16 cast stay as the SAME torch ops on
+  bit-identical contiguous inputs.
 * ``dsa_kpool_select`` -- k-pool decode selection epilogue: top-k pool ids -> sentinel
   where -> pool expansion -> always-selected tail pool -> concat -> position->row map ->
   ``-1`` holes, plus the constant ``cnt`` (was ~22 tiny kernels). ``torch.topk`` itself is
@@ -99,7 +100,7 @@ def dsa_store_rows(c_kv, k_rope, out_loc, latent, k_idx, idx_buf, gate, gate_buf
 # ---------------------------------------------------------------------------------------
 @triton.jit
 def _dsa_pool_prologue_kernel(
-    rows_ptr, kvv_ptr, kc_ptr, gc_ptr, ape_ptr, kk_ptr, lg_ptr, first_ptr,
+    rows_ptr, kvv_ptr, kc_ptr, gc_ptr, ape_ptr, kk_ptr, lg_ptr, dst_ptr,
     W, D,
     s_rb, s_rw, s_kc, s_gc, s_ape,
     KP: tl.constexpr, BLOCK_D: tl.constexpr,
@@ -112,25 +113,30 @@ def _dsa_pool_prologue_kernel(
     pcur = tl.maximum(kvl - 1, 0) // KP
     tok = pcur * KP + j                                   # tok = pcur*kp + arange(kp)
     valid = tok < kvl                                     # tok < kv_valid
+    # tok = where(valid, tok, pcur*kp): page-table entries past kvlen are a previous
+    # occupant's rows (unmapped after an elastic shrink) -- never dereference them
+    tok = tl.where(valid, tok, pcur * KP)
     tc = tl.minimum(tok, W - 1)                           # tok.clamp(max=W-1)
     rg = tl.load(rows_ptr + b * s_rb + tc * s_rw).to(tl.int64)
     rg = tl.maximum(rg, 0)                                # rows.gather(...).clamp(min=0)
     offs = tl.arange(0, BLOCK_D)
     m = offs < D
-    kk = tl.load(kc_ptr + rg * s_kc + offs, mask=m).to(tl.float32)   # kcache[rg].float()
-    gg = tl.load(gc_ptr + rg * s_gc + offs, mask=m).to(tl.float32)   # gcache[rg].float()
+    # kcache[rg].float().masked_fill(~valid, 0) / gcache[rg].float() (lane masked by -inf below)
+    kk = tl.load(kc_ptr + rg * s_kc + offs, mask=m & valid, other=0.0).to(tl.float32)
+    gg = tl.load(gc_ptr + rg * s_gc + offs, mask=m & valid, other=0.0).to(tl.float32)
     ap = tl.load(ape_ptr + j * s_ape + offs, mask=m).to(tl.float32)  # ape.float()
     lg = tl.where(valid, gg + ap, float("-inf"))
     o = (b * KP + j) * D + offs
     tl.store(kk_ptr + o, kk, mask=m)
     tl.store(lg_ptr + o, lg, mask=m)
     if j == 0:
-        first = tl.load(rows_ptr + b * s_rb + (pcur * KP) * s_rw).to(tl.int64)
-        tl.store(first_ptr + b, tl.maximum(first, 0))      # first.clamp(min=0).long()
+        # dst = rows.gather(1, (kvlen-1).clamp(min=0)).clamp(min=0): the newest token's row
+        dst = tl.load(rows_ptr + b * s_rb + tl.maximum(kvl - 1, 0) * s_rw).to(tl.int64)
+        tl.store(dst_ptr + b, tl.maximum(dst, 0))
 
 
 def dsa_pool_prologue(rows, kv_valid, kcache, gcache, ape, kp: int):
-    """-> (kk fp32 [bs,kp,D], logits fp32 [bs,kp,D], first int64 [bs]), bit-identical to
+    """-> (kk fp32 [bs,kp,D], logits fp32 [bs,kp,D], dst int64 [bs]), bit-identical to
     the eager ``_update_pools`` decode chain; all outputs fresh and contiguous. None when
     the slabs are not the plain row-major layout (caller keeps the eager chain)."""
     bs, W = rows.shape
@@ -143,14 +149,14 @@ def dsa_pool_prologue(rows, kv_valid, kcache, gcache, ape, kp: int):
         return None
     kk = torch.empty(bs, kp, D, dtype=torch.float32, device=rows.device)
     lg = torch.empty(bs, kp, D, dtype=torch.float32, device=rows.device)
-    first = torch.empty(bs, dtype=torch.int64, device=rows.device)
+    dst = torch.empty(bs, dtype=torch.int64, device=rows.device)
     _dsa_pool_prologue_kernel[(bs, kp)](
-        rows, kv_valid, kcache, gcache, ape, kk, lg, first,
+        rows, kv_valid, kcache, gcache, ape, kk, lg, dst,
         W, D,
         rows.stride(0), rows.stride(1), kcache.stride(0), gcache.stride(0), ape.stride(0),
         KP=kp, BLOCK_D=triton.next_power_of_2(D), num_warps=1,
     )
-    return kk, lg, first
+    return kk, lg, dst
 
 
 # ---------------------------------------------------------------------------------------

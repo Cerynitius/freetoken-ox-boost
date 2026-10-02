@@ -1,6 +1,59 @@
 --- a/python/freetoken/kernel/triton/glm_dsa_sparse.py
 +++ b/python/freetoken/kernel/triton/glm_dsa_sparse.py
-@@ -57,11 +57,12 @@
+@@ -24,10 +24,43 @@
+ 
+ from __future__ import annotations
+ 
++import os
++
+ import torch
+ import triton
+ import triton.language as tl
+ 
++# P.V precision. Both operands are fp32 in-kernel (P = exp(s - m) in fp32,
++# V = bf16 latent rows widened). tl.dot's default "tf32" feeds P to the tensor cores TRUNCATED to
++# a 10-bit mantissa (no cvt.rna in the PTX) -> every attention weight shrinks by 2^-11 on
++# average, a biased ~-0.03% scale on the output (the softmax denominator l uses the untruncated
++# p). Default "tf32rna": P is rounded to TF32 with round-to-nearest (cvt.rna.tf32.f32) before the
++# same tensor-core dot, so the hardware truncation is a no-op and the per-weight error is unbiased
++# (+-2^-11, 8x finer than HF, which rounds P to bf16 before its bf16 matmul); V is bf16-exact in
++# TF32, accumulation stays fp32. HF bit-parity is impossible with online softmax anyway. The Q.K
++# dots stay at the default: Q and K are bf16-exact, which TF32 represents exactly.
++#   FREETOKEN_DSA_PV_TF32=1        old behaviour (truncated, A/B)
++#   FREETOKEN_DSA_PV_PREC=tf32x3   3xTF32 split (fp32-level; ~2.7x the prefill attention time)
++# ("ieee" CUDA-core products need 133 KB of shared memory at these tiles: over sm_120's 99 KB.)
++_PV_PREC = (
++    "tf32" if os.environ.get("FREETOKEN_DSA_PV_TF32", "0") == "1"
++    else os.environ.get("FREETOKEN_DSA_PV_PREC", "tf32rna")
++)
++assert _PV_PREC in ("tf32rna", "tf32x3", "tf32"), f"FREETOKEN_DSA_PV_PREC={_PV_PREC!r}"
++_PV_DOT = "tf32" if _PV_PREC == "tf32rna" else _PV_PREC   # tl.dot input_precision
++_PV_RNA = _PV_PREC == "tf32rna"
++
++@triton.jit
++def _pv_round(p, RNA: tl.constexpr):
++    """fp32 -> TF32 round-to-nearest (low 13 bits zeroed), so the tensor core's truncation of the
++    fp32 operand is exact; identity when RNA is off."""
++    if RNA:
++        return tl.inline_asm_elementwise("cvt.rna.tf32.f32 $0, $1;", "=r,r", [p],
++                                         dtype=tl.float32, is_pure=True, pack=1)
++    else:
++        return p
++
++
+ BLOCK_H = 16
+ BLOCK_T = 32
+ MAX_SPLITS = 32
+@@ -49,6 +82,8 @@
+     BLOCK_H: tl.constexpr,
+     BLOCK_T: tl.constexpr,
+     HAS_COUNTS: tl.constexpr,
++    PV_DOT: tl.constexpr = "tf32",
++    PV_RNA: tl.constexpr = True,
+ ):
+     pid_m = tl.program_id(0)
+     pid_b = tl.program_id(1)
+@@ -57,11 +92,12 @@
      offs_h = pid_h * BLOCK_H + tl.arange(0, BLOCK_H)
      h_mask = offs_h < H
      offs_v = tl.arange(0, D_V)
@@ -15,7 +68,7 @@
  
      m_i = tl.full((BLOCK_H,), -float("inf"), dtype=tl.float32)
      l_i = tl.zeros((BLOCK_H,), dtype=tl.float32)
-@@ -79,9 +80,11 @@
+@@ -79,9 +115,11 @@
          valid = idxs >= 0
          kv_base = pool_ptr + idxs[:, None] * stride_pn
          kv_v = tl.load(kv_base + offs_v[None, :] * stride_pd, mask=valid[:, None], other=0.0).to(tl.float32)
@@ -30,7 +83,25 @@
          scores = tl.where(valid[None, :], scores, -float("inf"))
  
          m_new = tl.maximum(m_i, tl.max(scores, axis=1))
-@@ -221,7 +224,7 @@
+@@ -89,7 +127,7 @@
+         alpha = tl.where(m_new == -float("inf"), 1.0, tl.exp(m_i - m_new))
+         p = tl.where(valid[None, :], tl.exp(scores - m_new[:, None]), 0.0)
+         l_i = l_i * alpha + tl.sum(p, axis=1)
+-        acc = acc * alpha[:, None] + tl.dot(p.to(kv_v.dtype), kv_v)
++        acc = acc * alpha[:, None] + tl.dot(_pv_round(p, PV_RNA).to(kv_v.dtype), kv_v, input_precision=PV_DOT)
+         m_i = m_new
+ 
+     o = acc / l_i[:, None]
+@@ -208,6 +246,8 @@
+     BLOCK_T: tl.constexpr,
+     HAS_COUNTS: tl.constexpr,
+     NUM_SPLITS: tl.constexpr,
++    PV_DOT: tl.constexpr = "tf32",
++    PV_RNA: tl.constexpr = True,
+ ):
+     """Stage 1 (decode flash-decoding): each program reduces one BLOCK_T-aligned slice of
+     the candidate list and writes a normalized [D_V] partial + log-sum-exp. Same structure
+@@ -221,7 +261,7 @@
      offs_h = pid_h * BLOCK_H + tl.arange(0, BLOCK_H)
      h_mask = offs_h < H
      offs_v = tl.arange(0, D_V)
@@ -39,7 +110,7 @@
  
      n_active = TOPK
      if HAS_COUNTS:
-@@ -238,7 +241,8 @@
+@@ -238,7 +278,8 @@
      if split_end > split_start:
          q_base = q_ptr + pid_b * stride_qb + pid_m * stride_qm + offs_h[:, None] * stride_qh
          q_v = tl.load(q_base + offs_v[None, :] * stride_qd, mask=h_mask[:, None], other=0.0).to(tl.float32)
@@ -49,7 +120,7 @@
          idx_base = idx_ptr + pid_b * stride_ib + pid_m * stride_im
  
          for start in range(split_start, split_end, BLOCK_T):
-@@ -248,9 +252,11 @@
+@@ -248,16 +289,18 @@
              valid = idxs >= 0
              kv_base = pool_ptr + idxs[:, None] * stride_pn
              kv_v = tl.load(kv_base + offs_v[None, :] * stride_pd, mask=valid[:, None], other=0.0).to(tl.float32)
@@ -64,3 +135,29 @@
              scores = tl.where(valid[None, :], scores, -float("inf"))
  
              m_new = tl.maximum(m_i, tl.max(scores, axis=1))
+             alpha = tl.where(m_new == -float("inf"), 1.0, tl.exp(m_i - m_new))
+             p = tl.where(valid[None, :], tl.exp(scores - m_new[:, None]), 0.0)
+             l_i = l_i * alpha + tl.sum(p, axis=1)
+-            acc = acc * alpha[:, None] + tl.dot(p.to(kv_v.dtype), kv_v)
++            acc = acc * alpha[:, None] + tl.dot(_pv_round(p, PV_RNA).to(kv_v.dtype), kv_v, input_precision=PV_DOT)
+             m_i = m_new
+ 
+     out = tl.where(l_i[:, None] == 0.0, 0.0, acc / l_i[:, None])
+@@ -384,7 +427,7 @@
+             stride_nb, stride_nm,
+             D_V=d_v, D_R=d_r,
+             BLOCK_H=BLOCK_H, BLOCK_T=BLOCK_T,
+-            HAS_COUNTS=has_counts, NUM_SPLITS=n_splits,
++            HAS_COUNTS=has_counts, NUM_SPLITS=n_splits, PV_DOT=_PV_DOT, PV_RNA=_PV_RNA,
+             num_warps=4, num_stages=2,
+         )
+         grid2 = (m, b, h)
+@@ -410,7 +453,7 @@
+         stride_nb, stride_nm,
+         D_V=d_v, D_R=d_r,
+         BLOCK_H=BLOCK_H, BLOCK_T=BLOCK_T,
+-        HAS_COUNTS=has_counts,
++        HAS_COUNTS=has_counts, PV_DOT=_PV_DOT, PV_RNA=_PV_RNA,
+         num_warps=4, num_stages=2,
+     )
+     return o

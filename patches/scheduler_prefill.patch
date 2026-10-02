@@ -7,7 +7,7 @@
  from dataclasses import dataclass, field
  from typing import TYPE_CHECKING, List, Tuple
  
-@@ -7,6 +8,27 @@
+@@ -7,6 +8,38 @@
  from freetoken.core import Batch, Req
  from freetoken.utils import align_down, div_ceil, init_logger
  
@@ -32,10 +32,21 @@
 +# ErrorReplyMsg.code of a multimodal prompt the scheduler cannot prefill.
 +MM_REJECT_CODE = "multimodal_prompt_too_long"
 +
++# FREETOKEN_TEXT_PREFIX_TRACK=1 (default OFF until verified on GPU): a continuation chunk
++# inherits its ChunkedReq's hybrid-radix track boundary (mamba_last_track_seqlen: the x64
++# KDA/conv snapshot the chunk's forward froze into a ping-pong slot, attention/linear.py
++# _build_track_metadata). ChunkedReqs are never committed (scheduler._process_last_data), so
++# without the carry that snapshot is dropped -- and under split-last EVERY text prompt is an
++# (N-1)-token ChunkedReq + a 1-token Req, so text prompts never insert a reusable node and never
++# hit. With it the final Req's prefill commit (cache._cache_req_hybrid)
++# donates the frozen snapshot at the boundary (or the deeper one its own forward froze: the
++# ping-pong flip keeps the inherited slot intact until a newer track supersedes it).
++_TEXT_PREFIX_TRACK = os.environ.get("FREETOKEN_TEXT_PREFIX_TRACK", "0") == "1"
++
  from .utils import PendingReq
  
  if TYPE_CHECKING:
-@@ -25,6 +47,27 @@
+@@ -25,6 +58,27 @@
      return t.pin_memory() if torch.cuda.is_available() else t
  
  
@@ -63,7 +74,7 @@
  class ChunkedReq(Req):
      def _alloc_ids_buf(self) -> None:
          pass  # never sampled; keep input_ids a view of the pending prompt
-@@ -47,6 +90,38 @@
+@@ -47,6 +101,38 @@
      # allocated only in allocate_paged (after the pass), so swa_available_size does not decrement
      # across the admission loop -- without this, successive admits all see the full pool.
      reserved_swa: int = 0
@@ -102,7 +113,7 @@
  
      def _try_allocate_one(self, req: PendingReq):
          if self.table_manager.available_size == 0:
-@@ -106,7 +181,8 @@
+@@ -106,7 +192,8 @@
          if self.cache_manager.is_hybrid:
              pool = self.cache_manager.linear_state_pool
              linear_slot_idx = pool.alloc(1)[0]
@@ -112,7 +123,11 @@
  
          return handle, table_idx, linear_slot_idx, ping_pong, mr.mamba_value
  
-@@ -124,6 +200,9 @@
+@@ -121,9 +208,13 @@
+         next_track_idx: int = 0,
+         restore_src: int | None = None,
+         swa_evicted_seqlen: int = 0,
++        last_track_seqlen: int | None = None,
      ) -> Req | None:
          remain_len = pending_req.input_len - cached_len
          chunk_size = min(self.token_budget, remain_len)
@@ -122,7 +137,7 @@
          if self.cache_manager.swa_paged:
              # Cap this chunk by the swa the pool can back this pass. swa is allocated per token in
              # allocate_paged, and token_budget (max_extend_tokens, default 8192) won't chunk a
-@@ -153,10 +232,43 @@
+@@ -153,10 +244,43 @@
                  if aligned <= 0:
                      return None
                  chunk_size = aligned
@@ -169,7 +184,7 @@
          CLS = ChunkedReq if is_chunked else Req
          self.token_budget -= chunk_size
          self.reserved_size += remain_len + pending_req.output_len
-@@ -164,11 +276,37 @@
+@@ -164,11 +288,37 @@
          _slice = slice(cached_len, cached_len + chunk_size)
          device_ids = self.table_manager.token_pool[table_idx, _slice]
          device_ids.copy_(_maybe_pinned(pending_req.input_ids[_slice]), non_blocking=True)
@@ -211,7 +226,7 @@
          req = CLS(
              input_ids=pending_req.input_ids[: cached_len + chunk_size],
              table_idx=table_idx,
-@@ -177,10 +315,11 @@
+@@ -177,15 +327,18 @@
              uid=pending_req.uid,
              cache_handle=cache_handle,
              sampling_params=pending_req.sampling_params,
@@ -224,7 +239,24 @@
          req.linear_slot_idx = linear_slot_idx
          req.mamba_ping_pong = ping_pong
          req.mamba_next_track_idx = next_track_idx
-@@ -218,12 +357,16 @@
+         req.mamba_restore_src = restore_src
+         req.swa_evicted_seqlen = swa_evicted_seqlen  # carry the extend-free watermark across chunks
++        # pending (uncommitted) track snapshot of the prior chunk; None on a fresh admit
++        req.mamba_last_track_seqlen = last_track_seqlen
+         return req
+ 
+     def try_add_one(self, pending_req: PendingReq) -> Req | None:
+@@ -203,6 +356,9 @@
+                 next_track_idx=chunked_req.mamba_next_track_idx,
+                 restore_src=None,  # continuation chunk already has live state
+                 swa_evicted_seqlen=chunked_req.swa_evicted_seqlen,  # extend-free watermark so far
++                last_track_seqlen=(
++                    chunked_req.mamba_last_track_seqlen if _TEXT_PREFIX_TRACK else None
++                ),
+             )
+ 
+         if resource := self._try_allocate_one(pending_req):
+@@ -218,12 +374,16 @@
                  restore_src=restore_src,
              )
              if req is None:
@@ -244,7 +276,7 @@
              return req
  
          return None
-@@ -235,10 +378,21 @@
+@@ -235,10 +395,21 @@
      table_manager: TableManager
      decode_manager: DecodeManager
      pending_list: List[PendingReq] = field(default_factory=list)
@@ -267,7 +299,7 @@
          )
  
      def schedule_next_batch(self, prefill_budget: int) -> Batch | None:
-@@ -251,6 +405,7 @@
+@@ -251,6 +422,7 @@
              reserved_size=self.decode_manager.inflight_tokens,
              cache_manager=self.cache_manager,
              table_manager=self.table_manager,
@@ -275,7 +307,7 @@
          )
          reqs: List[Req] = []
          chunked_list: List[PendingReq] = []
-@@ -260,9 +415,11 @@
+@@ -260,9 +432,11 @@
          # once at admission, so continuation chunks (already-chunked reqs) contribute 0.
          log_new_tokens = 0
          log_cached_tokens = 0
@@ -287,7 +319,7 @@
                  pending_req.chunked_req = None
                  if isinstance(req, ChunkedReq):
                      pending_req.chunked_req = req
-@@ -278,11 +435,19 @@
+@@ -278,11 +452,19 @@
                  log_new_tokens += req.extend_len
                  if not is_continuation:
                      log_cached_tokens += req.cache_handle.cached_len

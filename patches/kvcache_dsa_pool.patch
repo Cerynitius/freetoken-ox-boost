@@ -106,7 +106,7 @@
  
      def _alloc(self, num_pages: int) -> None:
          # Both slabs in one allocation step: rebuild can never leave the pool with a
-@@ -152,16 +202,28 @@
+@@ -152,16 +202,30 @@
          super()._alloc(num_pages)
          # bf16 == the 2 bytes/token/layer the KV cost model budgets for this slab
          # (cache_status._kv_cost_model); keep the two in lockstep.
@@ -123,8 +123,10 @@
 +        else:
 +            self._index_k_buffer = torch.zeros(*shape, dtype=torch.bfloat16, device=self._device)
 +        # k-pool (GLM-5.3): raw gate-score slab (same row addressing as the key slab) and
-+        # the pooled-key slab, where pool p's key is stored at the PHYSICAL ROW OF ITS FIRST
-+        # TOKEN (rows[kpool*p]); scoring gathers via the strided pool-row snapshot.
++        # the pooled-key slab, where pool p's key is stored at the PHYSICAL ROW OF ITS LAST
++        # TOKEN (rows[kpool*p + kpool-1], written once the pool is complete -- always the
++        # writer's own row, never a radix-shared one); scoring gathers via the strided
++        # pool-row snapshot (attention/dsa.py _pool_key_rows).
 +        if self._index_kpool > 1 and self._slabs is not None:
 +            self._gate_buffer = self._slabs.alloc(shape, torch.bfloat16, zero=True)
 +            self._pool_k_buffer = self._slabs.alloc(shape, torch.bfloat16, zero=True)
@@ -142,7 +144,7 @@
          super().rebuild(num_pages)
  
      def unit_bytes(self) -> tuple[int, int]:
-@@ -170,7 +232,13 @@
+@@ -170,7 +234,13 @@
          kv, swa = super().unit_bytes()
          idx = self._index_k_buffer
          tokens = self._num_pages * self._page_size
@@ -157,7 +159,7 @@
  
      def index_k_cache(self, slot: int) -> torch.Tensor:
          """Row-flat index keys for a full-indexer layer slot: ``[rows, index_head_dim]``."""
-@@ -179,5 +247,19 @@
+@@ -179,5 +249,19 @@
      def store_index_k(self, k: torch.Tensor, out_loc: torch.Tensor, slot: int) -> None:
          self._index_k_buffer[slot][out_loc] = k
  
@@ -172,7 +174,7 @@
 +        return self._pool_k_buffer[slot]
 +
 +    def store_pool_k(self, k: torch.Tensor, rows: torch.Tensor, slot: int) -> None:
-+        """Scatter pooled keys at the pools' first-token physical rows (int64 rows)."""
++        """Scatter pooled keys at the pools' last-token physical rows (int64 rows)."""
 +        self._pool_k_buffer[slot][rows] = k
 +
  

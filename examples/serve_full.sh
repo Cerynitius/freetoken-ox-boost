@@ -3,7 +3,9 @@
 # which caps host->GPU expert copies at ~47 GB/s). Adjust paths, memory ratio and preflight for your machine.
 #
 # Every switch below is lossless: greedy outputs were checked token-for-token against the plain config
-# (text, prefix-cache hits, images). Measured 2026-10-02, ~0.9k-token prompts, 1024 generated tokens, T=0:
+# (text, prefix-cache hits, images); FREETOKEN_TEXT_PREFIX_TRACK only lets text prompts take the prefix-hit path,
+# where, as for images, a hit can differ from a fresh prefill at bf16 ties.
+# Measured 2026-10-02, ~0.9k-token prompts, 1024 generated tokens, T=0:
 #   single stream ~38 tok/s, 2 concurrent ~45 tok/s aggregate; decode stays ~37 tok/s at 128K context.
 #
 # Memory: 8 resident layers (3-6, 8-11) live in VRAM; the other 34 MoE layers are a pinned host bank (~129 GiB)
@@ -44,6 +46,7 @@ export FREETOKEN_NVFP4_SWIGLU_FUSED=${FREETOKEN_NVFP4_SWIGLU_FUSED:-1}
 export FREETOKEN_PREFILL_ONDEMAND_TOKENS=${FREETOKEN_PREFILL_ONDEMAND_TOKENS:-128}  # short extends fetch only used experts
 export FREETOKEN_GLM5_VISION_ATTN_CHUNK=${FREETOKEN_GLM5_VISION_ATTN_CHUNK:-512}    # + FREETOKEN_GLM5_VISION_ATTN_BUDGET_MB (256)
 export FREETOKEN_MM_CHUNKED_PREFILL=${FREETOKEN_MM_CHUNKED_PREFILL:-1}              # large images span prefill chunks
+export FREETOKEN_TEXT_PREFIX_TRACK=${FREETOKEN_TEXT_PREFIX_TRACK:-1}                # text prompts reuse cached prefixes
 
 MODEL=${GLM5_MODEL:-/path/to/GLM-5.3-Flash-NVFP4}
 PORT=${GLM5_PORT:-1920}

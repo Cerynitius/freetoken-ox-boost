@@ -76,6 +76,27 @@ _ATTN_CHUNK = int(__import__("os").environ.get("FREETOKEN_GLM5_VISION_ATTN_CHUNK
 # With chunking on, the rows per chunk also shrink with the image so one chunk's fp32 scores [H, rows, L] stay within
 # FREETOKEN_GLM5_VISION_ATTN_BUDGET_MB (default 256): a 3840x2160 image (~42k patches) at 512 rows needed 1.4 GiB.
 _ATTN_BUDGET = int(__import__("os").environ.get("FREETOKEN_GLM5_VISION_ATTN_BUDGET_MB", "256") or 256) << 20
+# FREETOKEN_GLM5_VISION_TOKEN_BUDGET_MB (default 0 = off; active only with FREETOKEN_GLM5_VISION_ATTN_CHUNK > 0): the
+# row-independent per-token parts -- norm1 + qkv + q/k RMSNorm + rope, proj + residual, norm2 + MLP + residual,
+# post_layernorm, merger -- run in row chunks sized so one chunk's transients stay within the budget. Unchunked,
+# a 3840x2160 image (31892 patches) holds ~6 [S, 4096] bf16 MLP intermediates (~1.5 GiB) plus ~0.8 GiB of fp32
+# rope/norm temporaries per block (a 250 MiB MLP alloc OOMed at memory ratio 0.96). Every chunked
+# op is row-wise (linear rows, RMS/LayerNorm over the last dim, elementwise rope/act/clamp/residual), so each row is
+# the same computation; images that fit one chunk (<= 10922 patches at 512 MiB: 1280x720, 1920x1080) take the
+# unchanged code path.
+# Default 0 = OFF: chunked GEMMs run at a different M, so on the GPU a chunked image is NOT bit-identical to the
+# unchunked path (2026-10-02 gpu_kernel_tests G: 4K and 1080p both differ; 4K peak only -188 MiB). A 3840x2160
+# image fits unchunked at memory ratio 0.96 with the attention budget above; set e.g. 512 if one OOMs.
+_TOK_BUDGET = int(__import__("os").environ.get("FREETOKEN_GLM5_VISION_TOKEN_BUDGET_MB", "0") or 0) << 20
+
+
+def _tok_rows(n: int, row_bytes: int) -> int:
+    """Rows per chunk for ``n`` rows whose per-row transient working set is ~``row_bytes``;
+    0 = run unchunked (chunking off, or the whole tensor fits one chunk)."""
+    if not _ATTN_CHUNK or not _TOK_BUDGET:
+        return 0
+    rows = max(64, _TOK_BUDGET // max(row_bytes, 1))
+    return rows if n > rows else 0
 
 
 class _VAttention(BaseOP):
@@ -93,6 +114,30 @@ class _VAttention(BaseOP):
         q = self.q_norm.forward(q)
         k = self.k_norm.forward(k)
         q, k = _apply_rope_vision(q, k, cos, sin)
+        return self.proj.forward(self.attend(q, k, v, bounds))
+
+    def qkv_rope_chunked(self, x, norm, cos, sin, rows):
+        """norm -> qkv -> q/k RMSNorm -> rope, ``rows`` tokens at a time, into whole-image
+        [S, H, D] q/k/v buffers (row-wise ops: each row equals the unchunked path's row)."""
+        S = x.shape[0]
+        q = k = v = None
+        for s in range(0, S, rows):
+            e = min(s + rows, S)
+            qs, ks, vs = self.qkv.forward(norm.forward(x[s:e])).reshape(
+                e - s, 3, self._heads, -1).permute(1, 0, 2, 3).unbind(0)
+            qs = self.q_norm.forward(qs)
+            ks = self.k_norm.forward(ks)
+            qs, ks = _apply_rope_vision(qs, ks, cos[s:e], sin[s:e])
+            if q is None:
+                q, k, v = (t.new_empty((S,) + tuple(t.shape[1:])) for t in (qs, ks, vs))
+            q[s:e] = qs
+            k[s:e] = ks
+            v[s:e] = vs
+        return q, k, v
+
+    def attend(self, q, k, v, bounds):
+        """[S, H, D] q/k/v -> [S, H*D] (pre-proj) attention output."""
+        S = q.shape[0]
         # per-image full attention (bounds delimits images), exact sdpa per chunk
         outs = []
         for i in range(len(bounds) - 1):
@@ -110,8 +155,7 @@ class _VAttention(BaseOP):
             else:
                 oi = F.scaled_dot_product_attention(qi, ki, vi, scale=self._scale)
             outs.append(oi.transpose(0, 1))
-        out = torch.cat(outs, dim=0).reshape(S, -1)
-        return self.proj.forward(out)
+        return torch.cat(outs, dim=0).reshape(S, -1)
 
 
 class _VMLP(BaseOP):
@@ -133,10 +177,25 @@ class _VBlock(BaseOP):
         self.norm2 = _VNorm(vc["hidden_size"], vc["rms_norm_eps"])
         self.attn = _VAttention(vc)
         self.mlp = _VMLP(vc, vc["hidden_size"], vc["intermediate_size"], vc["attention_bias"])
+        # per-row transients: ~6 [inter] bf16 MLP tensors vs ~32 B/dim of qkv + fp32 norm/rope
+        self._row_bytes = max(12 * vc["intermediate_size"], 32 * vc["hidden_size"])
 
     def forward(self, x, bounds, cos, sin):
-        x = x + self.attn.forward(self.norm1.forward(x), bounds, cos, sin)
-        x = x + self.mlp.forward(self.norm2.forward(x))
+        rows = _tok_rows(x.shape[0], self._row_bytes)
+        if not rows:
+            x = x + self.attn.forward(self.norm1.forward(x), bounds, cos, sin)
+            x = x + self.mlp.forward(self.norm2.forward(x))
+            return x
+        # Large image: same ops, per-token parts in row chunks. Attention needs every row's
+        # q/k/v before any residual update, so build them first; then proj + residual and the
+        # MLP block per chunk, written back into x (the block owns its input).
+        q, k, v = self.attn.qkv_rope_chunked(x, self.norm1, cos, sin, rows)
+        out = self.attn.attend(q, k, v, bounds)
+        del q, k, v
+        for s in range(0, x.shape[0], rows):
+            e = min(s + rows, x.shape[0])
+            xa = x[s:e] + self.attn.proj.forward(out[s:e])
+            x[s:e] = xa + self.mlp.forward(self.norm2.forward(xa))
         return x
 
 
@@ -251,11 +310,25 @@ class Glm5Vision(BaseOP):
         sin = emb.sin().unsqueeze(-2).float()
         for blk in self.blocks.op_list:
             x = blk.forward(x, bounds, cos, sin)
-        x = self.post_layernorm.forward(x)
+        rows = _tok_rows(x.shape[0], self.blocks.op_list[0]._row_bytes) if self.blocks.op_list else 0
+        if rows:
+            for s in range(0, x.shape[0], rows):
+                x[s:s + rows] = self.post_layernorm.forward(x[s:s + rows])
+        else:
+            x = self.post_layernorm.forward(x)
         m = vc["spatial_merge_size"]
         x = x.view(-1, m, m, x.shape[-1]).permute(0, 3, 1, 2)
         x = self.downsample.forward(x).view(-1, vc["out_hidden_size"])
-        return self.merger.forward(x)
+        rows = _tok_rows(x.shape[0], 12 * vc["projection_intermediate_size"])
+        if not rows:
+            return self.merger.forward(x)
+        out = None
+        for s in range(0, x.shape[0], rows):
+            o = self.merger.forward(x[s:s + rows])
+            if out is None:
+                out = o.new_empty((x.shape[0],) + tuple(o.shape[1:]))
+            out[s:s + rows] = o
+        return out
 
 
 __all__ = ["Glm5Vision"]
