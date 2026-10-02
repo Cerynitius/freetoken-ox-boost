@@ -13,7 +13,7 @@
  
  from .mlp import GlmDsaGatedMLP
  
-@@ -23,6 +25,34 @@
+@@ -23,6 +25,35 @@
  
  TopK = Tuple[torch.Tensor, torch.Tensor]
  
@@ -24,6 +24,7 @@
 +# the list the Naive router stashes (naive_n05/model.py NaiveMoE._route). Routing ids and
 +# weights are unchanged (fused_route_ranked: same kernel loop, ranks < top_k == fused_route).
 +_SOFT_RANK = _os.environ.get("FREETOKEN_GLM5_SOFT_RANK", "0") == "1"
++_LEGACY_NUMERICS = _os.environ.get("FREETOKEN_GLM5_LEGACY_NUMERICS", "0") == "1"
 +_SOFT_NRANK = 16  # list length, as in Naive (8 selected + 8 near-misses)
 +# FREETOKEN_GLM5_SOFT_RANK_BS2=1 (with FREETOKEN_GLM5_SOFT_RANK=1): also emit the ranked list
 +# for 2 <= bs <= _SOFT_RANK_MAXM, as [M, 16] per-token rows (each row: that token's top-8
@@ -48,7 +49,20 @@
  
  class GlmMoeDsaSparseBlock(BaseOP):
      def __init__(self, config: ModelConfig, layer_id: int):
-@@ -40,17 +70,55 @@
+@@ -34,23 +65,65 @@
+         self.topk_group = config.topk_group
+ 
+         self.gate = LinearReplicated(config.hidden_size, config.num_experts, has_bias=False)
+-        # DeepSeek-style selection bias; kept fp32 in HF, stored in the model dtype and
+-        # upcast at use (exact enough for the argmax-style top-k selection).
+-        self.e_score_correction_bias = torch.empty(config.num_experts)
++        # DeepSeek-style selection bias, kept fp32 as in HF (_keep_in_fp32_modules_strict) and the
++        # checkpoint. It is NOT "exact enough" in bf16: GLM-5.3's biases are ~11.5 (max 14.5), so bf16
++        # rounds them by up to 0.03 -- a fixed per-expert offset next to sigmoid scores in (0, 1),
++        # which flips near-tied top-8 picks (review 2026-10-02). FREETOKEN_GLM5_LEGACY_NUMERICS=1
++        # restores the old bf16 storage for A/B only.
++        self.e_score_correction_bias = torch.empty(
++            config.num_experts, dtype=None if _LEGACY_NUMERICS else torch.float32)
  
          # The offload cache indexes experts by *MoE* layer (global layer minus
          # first_k_dense_replace), matching how the loader packs the expert banks.
@@ -109,7 +123,7 @@
      def _group_limited(self, scores_for_choice: torch.Tensor) -> torch.Tensor:
          m = scores_for_choice.shape[0]
          e, g = self.num_experts, self.n_group
-@@ -64,11 +132,44 @@
+@@ -64,11 +137,44 @@
      def _route(self, hidden_states: torch.Tensor) -> TopK:
          # HF computes the router logits in fp32; the gate is tiny so we match it exactly.
          logits = F.linear(hidden_states.float(), self.gate.weight.float())
@@ -154,7 +168,7 @@
          topk_weights = scores.gather(-1, topk_ids)
          if self.norm_topk_prob:
              topk_weights = topk_weights / (topk_weights.sum(dim=-1, keepdim=True) + 1e-20)
-@@ -76,11 +177,36 @@
+@@ -76,11 +182,36 @@
          return topk_weights.to(torch.float32).contiguous(), topk_ids.to(torch.int32).contiguous()
  
      def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:

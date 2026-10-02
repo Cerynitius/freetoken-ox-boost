@@ -82,7 +82,7 @@ type). Since 2026-10-02 an image prompt no longer has to fit one prefill chunk
 
 All lossless: each switch was checked by greedy decoding of three ~0.9K-token
 prompts x 1024 tokens against the configuration before it (token-for-token
-identical), plus prefix-cache repeats and images where relevant. Speeds are
+identical), plus images where relevant. Speeds are
 single-stream / 2-concurrent aggregate tok/s on the same prompts. All are on in
 `examples/serve_full.sh`.
 

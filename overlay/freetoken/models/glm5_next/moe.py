@@ -3,6 +3,8 @@ swiglu_clamp via config.swiglu_limit) with the SHARED expert also clamped."""
 
 from __future__ import annotations
 
+import os as _os
+
 from freetoken.layers.moe import make_moe_layer
 from freetoken.models.config import ModelConfig
 from freetoken.models.glm_moe_dsa.moe import GlmMoeDsaSparseBlock
@@ -21,17 +23,27 @@ def offload_moe_layers(config: ModelConfig):
     ]
 
 
+_LEGACY_NUMERICS = _os.environ.get("FREETOKEN_GLM5_LEGACY_NUMERICS", "0") == "1"
+
+
 class Glm5SparseBlock(GlmMoeDsaSparseBlock):
     def _make_experts(self, config: ModelConfig, layer_id: int):
         activation = "swiglu_clamp" if getattr(config, "swiglu_limit", None) else "silu"
         if layer_id in config.glm5_args.resident_layer_ids:
             return ResidentNvfp4Experts(config, activation, layer_id=layer_id)
-        # Offload bank ids are dense over the NON-resident MoE layers.
+        # Offload bank ids are dense over the NON-resident MoE layers. The clamp limit must be
+        # handed over explicitly (make_moe_layer only sets swiglu_limit through extra_attrs): without
+        # it the offload kernels fell back to act_limit=inf and the 34 offloaded MoE layers ran
+        # UNclamped swiglu (2026-08-27 .. 2026-10-02; HF clamps gate <= limit, up to [-limit, limit]).
+        # FREETOKEN_GLM5_LEGACY_NUMERICS=1 restores the old unclamped behaviour for A/B only.
+        extra = ({"swiglu_limit": float(config.swiglu_limit)}
+                 if activation == "swiglu_clamp" and not _LEGACY_NUMERICS else None)
         return make_moe_layer(
             config,
             layer_id=offload_moe_layers(config).index(layer_id),
             renormalize=config.norm_topk_prob,
             activation=activation,
+            extra_attrs=extra,
         )
 
     def __init__(self, config: ModelConfig, layer_id: int):

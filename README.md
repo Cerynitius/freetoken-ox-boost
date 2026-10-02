@@ -11,8 +11,8 @@ PCIe Gen5 x16, host DDR5 at 3600 MT/s) on a single RTX PRO 6000 Blackwell
 96 GB with `examples/serve_full.sh`: **~38 tok/s single-stream and ~45 tok/s
 aggregate at 2 concurrent requests**, decode flat to 128K context (~37 tok/s).
 The first adaptation ran 17.8 tok/s. Every optimization is lossless: greedy
-outputs match the plain configuration token for token (text, prefix-cache
-hits, images), and the model itself matches the HF reference implementation
+outputs match the plain configuration token for token (text and images),
+and the model itself matches the HF reference implementation
 48/48 steps. Vision (image and video input) is supported end-to-end — see
 below.
 
@@ -35,7 +35,7 @@ with ~0.9K-token prompts, 1024 generated tokens and greedy decoding.
 | 2-way concurrent aggregate | **~45 tok/s** (22.5 per stream) | 2026-10-02 |
 | Decode at long context | 38.7 / 37.4 / 36.8 tok/s | 2026-10-02, 16K / 64K / 128K context, 256 generated |
 | Long-context prefill | 14 s / 38 s / 75 s | 2026-10-02, 16K / 64K / 128K (chunk 4096) |
-| TTFT (~0.9K-token prompt) | 2.3-2.4 s warm, 4.1 s first request | 2026-10-02; a prefix-cache repeat 2.3 s |
+| TTFT (~0.9K-token prompt) | 2.3-2.4 s warm, 4.1 s first request | 2026-10-02 |
 | MoE offload misses | ~31 per token (miss rate 0.11) | 2026-10-02, 3337 cache slots + 8 resident layers |
 | Real labeling load | 124/124 valid requests in 30 min, no loops, no swap growth | 2026-10-02, 2 workers, T=1.0, reasoning effort high |
 | 4-way concurrent aggregate | ~49 tok/s (12 per stream) | 2026-08, 1-slot 256K pool; 2026-10-02 max-running 4 measured lower than 2 |
