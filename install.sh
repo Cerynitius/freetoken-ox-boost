@@ -19,7 +19,7 @@ fi
 echo "== dry-run: checking patches =="
 FAIL=0
 for p in "$HERE"/patches/*.patch; do
-  if git apply --check -p1 --directory="$TARGET" "$p" 2>/dev/null; then
+  if git apply --check --unsafe-paths -p1 --directory="$TARGET" "$p" 2>/dev/null; then
     echo "  ok   $(basename "$p")"
   else
     echo "  FAIL $(basename "$p")  (already applied, or baseline mismatch)"
@@ -31,19 +31,12 @@ done
 
 echo "== applying patches =="
 for p in "$HERE"/patches/*.patch; do
-  git apply -p1 --directory="$TARGET" "$p"
+  git apply --unsafe-paths -p1 --directory="$TARGET" "$p"
 done
 
 echo "== copying overlay files =="
-cp -R "$HERE"/overlay/freetoken/models/glm5_next "$TARGET"/python/freetoken/models/
-cp "$HERE"/overlay/freetoken/kernel/triton/kda_gate.py \
-   "$HERE"/overlay/freetoken/kernel/triton/fused_route.py \
-   "$TARGET"/python/freetoken/kernel/triton/
-cp "$HERE"/overlay/freetoken/kernel/triton/dsv4/hc_norm.py "$TARGET"/python/freetoken/kernel/triton/dsv4/
-cp "$HERE"/overlay/freetoken/moe/spec_prefetch.py \
-   "$HERE"/overlay/freetoken/moe/lfu_ensure.py \
-   "$TARGET"/python/freetoken/moe/
-cp "$HERE"/overlay/freetoken/gpu_select.py "$TARGET"/python/freetoken/
+# the whole overlay tree (new files only; mirrors python/freetoken/)
+cp -R "$HERE"/overlay/freetoken/. "$TARGET"/python/freetoken/
 
 python3 -m compileall -q "$TARGET"/python/freetoken && echo "== done: syntax check passed =="
 echo "launch example: examples/serve_full.sh; switches: MANIFEST.md"

@@ -8,7 +8,7 @@
      ) -> torch.Tensor:
          """Expert compute for an externally computed routing decision (``TopK``).
  
-@@ -194,6 +195,31 @@
+@@ -194,6 +195,44 @@
          return self._maybe_all_reduce(final_hidden_states)
  
  
@@ -25,12 +25,25 @@
 +# Speculative expert prefetch count per token (0 = off); see moe/spec_prefetch.py.
 +_SPEC_BLOCK_OF: dict = {}  # id(OffloadMoELayer) -> its sparse block (cycle-free)
 +_SPEC_PREFETCH = int(os.environ.get("FREETOKEN_MOE_SPEC_PREFETCH", "0") or 0)
++# split decode: launch layer L+1's prefetch right after L's demand copy (same copy stream,
++# before L's GEMM) instead of after it. Opt-in (=1): measured a loss on Naive (P=3 -5%).
++_SPEC_EARLY = os.environ.get("FREETOKEN_MOE_SPEC_EARLY", "0") == "1"
++# streamed prefill >= this many tokens runs the flashinfer b12x tensor-core MoE on the
++# double buffer (repacked in place on its own stream; kernel/b12x_repack.py). OPT-IN
++# (0 = off): long-prompt TTFT -30% (16K 6.3 -> 4.3 s), but b12x's combine is
++# nondeterministic and its 8-position KL vs fp32 is 0.0176 vs 0.0096 for the official
++# bf16 implementation / 0.0109 for the default Triton path (2026-09-29).
++_B12X_PREFILL = int(os.environ.get("FREETOKEN_B12X_PREFILL", "0") or 0)
 +
 +# Overlap the decode miss-fetch (UVA gather kernel) with caller-provided compute on a
 +# side stream: the copy kernel is latency/DMA-bound and uses few SMs, so e.g. the shared
 +# expert GEMV runs concurrently instead of serially behind it. fork(join) pattern is
 +# CUDA-graph-capture safe (the side stream's work becomes ordinary graph nodes).
 +_COPY_OVERLAP = os.getenv("FREETOKEN_MOE_COPY_OVERLAP", "0") == "1"
++# Hit/miss split decode (nvfp4 offload): the miss copy runs on a side stream while the
++# already-resident experts' GEMMs run on the main stream; the missed routes compute once
++# the copy lands. Same kernels and per-route math as the fused path -> identical output.
++_SPLIT_OVERLAP = os.getenv("FREETOKEN_MOE_SPLIT_OVERLAP", "0") == "1"
 +
 +# Short-prefill on-demand fetch threshold (tokens); 0 disables (always stream).
 +_PREFILL_ONDEMAND_TOKENS = int(os.environ.get("FREETOKEN_PREFILL_ONDEMAND_TOKENS", "48") or 0)
@@ -40,16 +53,25 @@
  class OffloadMoELayer(MoELayer):
      def __init__(
          self,
-@@ -236,6 +262,7 @@
+@@ -236,6 +275,8 @@
          hidden_states: torch.Tensor,
          topk_weights: torch.Tensor,
          topk_ids: torch.Tensor,
 +        overlap_fn=None,
++        split_overlap_fn=None,
      ) -> torch.Tensor:
          """Expert compute for an externally computed routing decision (``TopK``).
  
-@@ -245,16 +272,32 @@
+@@ -243,18 +284,41 @@
+         scores, selection bias, group-limited top-k, ...); identical to ``forward``
+         past the router. ``topk_ids`` must be safe to mutate in place (decode
          rewrites expert ids into cache slot ids); pass a fresh tensor or a clone.
++
++        ``split_overlap_fn`` (default None = unchanged): a no-argument callable run on
++        the main stream inside the hit/miss split decode, right after the miss copy was
++        queued on the side stream (see ``_decode_split``). Only that path calls it; every
++        other path (prefill, CPU/hybrid/miss-cap layers, split off) never does, so the
++        caller must check whether it ran. It must not touch the expert cache.
          """
          ctx = get_global_ctx()
 +        if _ROUTE_TRACE:
@@ -71,7 +93,8 @@
              out = self._prefill_routed(hidden_states, topk_weights, topk_ids)
          else:
 -            out = self._decode_routed(hidden_states, topk_weights, topk_ids)
-+            out = self._decode_routed(hidden_states, topk_weights, topk_ids, overlap_fn=overlap_fn)
++            out = self._decode_routed(hidden_states, topk_weights, topk_ids, overlap_fn=overlap_fn,
++                                      split_overlap_fn=split_overlap_fn)
          return self._maybe_all_reduce(out)
  
      def decode_forward(
@@ -82,7 +105,7 @@
      ):
          topk_weights, topk_ids = fused_topk(
              hidden_states=hidden_states,
-@@ -262,7 +305,7 @@
+@@ -262,7 +326,7 @@
              topk=self.top_k,
              renormalize=self.renormalize,
          )
@@ -91,15 +114,16 @@
  
      def prefill_forward(
          self,
-@@ -290,6 +333,7 @@
+@@ -290,6 +354,8 @@
          hidden_states: torch.Tensor,
          topk_weights: torch.Tensor,
          topk_ids: torch.Tensor,
 +            overlap_fn=None,
++            split_overlap_fn=None,
      ) -> torch.Tensor:
          """On-demand load: ``ensure_experts`` rewrites ``topk_ids`` into cache slot
          ids in place (loading missing experts), then the GEMM reads the full slot
-@@ -307,11 +351,64 @@
+@@ -307,11 +373,67 @@
              executor = cache.cpu_executor
              assert executor is not None, "CPU MoE executor was not initialized"
              return executor.decode(self.layer_id, hidden_states, topk_weights, topk_ids)
@@ -143,6 +167,9 @@
 +            if pf is not None:
 +                pf.launch(self.layer_id, hidden_states)
 +            return out
++        if _SPLIT_OVERLAP and cache.quant_format == "nvfp4" and overlap_fn is None:
++            return self._decode_split(cache, hidden_states, topk_weights, topk_ids, pf,
++                                      side_fn=split_overlap_fn)
          cache.ensure_experts(self.layer_id, topk_ids)
 -        cache.copy_missing()
 -        return self._expert_gemm(
@@ -167,11 +194,65 @@
              cache,
              hidden_states,
              topk_weights,
-@@ -321,6 +418,28 @@
+@@ -321,6 +443,82 @@
              alphas=cache.alphas_for_slots(self.layer_id),
              is_prefill=False,
          )
 +        if pf is not None:
++            pf.launch(self.layer_id, hidden_states)
++        return out
++
++    def _decode_split(self, cache, hidden_states, topk_weights, topk_ids, pf, side_fn=None):
++        from freetoken.moe.fused_nvfp4 import fused_experts_decode_nvfp4_split
++
++        from freetoken.utils.regions import region
++
++        base = self.layer_id * cache.num_experts
++        if cache.cache_policy == "soft":
++            # the soft ensure kernel writes the per-route (hit, miss) int8 masks itself
++            miss = (
++                torch.empty(topk_ids.numel(), dtype=torch.int8, device=topk_ids.device),
++                torch.empty(topk_ids.numel(), dtype=torch.int8, device=topk_ids.device),
++            )
++            cache._soft_masks = miss
++        else:
++            with region("moe.miss_mask"):
++                miss = cache.slot_for_id.view(-1)[topk_ids.long() + base] < 0  # pre-ensure
++        with region("moe.ensure"):
++            cache.ensure_experts(self.layer_id, topk_ids)  # ids -> slots, plans the miss copy
++        cs = getattr(cache, "_copy_overlap_stream", None)
++        if cs is None:
++            cs = cache._copy_overlap_stream = torch.cuda.Stream(device=hidden_states.device)
++            cache._copy_overlap_events = [torch.cuda.Event() for _ in range(cache.num_layers)]
++        cur = torch.cuda.current_stream()
++        cs.wait_stream(cur)  # slot assignment/eviction must be visible to the copy
++        ev = cache._copy_overlap_events[self.layer_id]
++        with torch.cuda.stream(cs), region("moe.copy(side)"):
++            cache.copy_missing()
++            ev.record(cs)
++        if pf is not None and _SPEC_EARLY:
++            with region("moe.prefetch"):
++                pf.launch_early(self.layer_id, hidden_states, cs)
++        if side_fn is not None:
++            # Caller work that reads no expert slot (GLM: the shared expert, see
++            # FREETOKEN_GLM5_SHARED_OVERLAP), queued on the main stream while the miss copy
++            # is in flight on cs -- and BEFORE the prefetch wait below, so it also fills a
++            # stall on a late prefetch copy. Ordering only: no new stream/event, the copy
++            # branch still joins at phase B's wait on ev (graph capture unchanged).
++            with region("moe.side_fn"):
++                side_fn()
++        if pf is not None:
++            pf.before_gemm(self.layer_id)
++        act_alpha = getattr(self, "hidden_act_alpha", 1.702)
++        act_limit = getattr(self, "swiglu_limit", None)
++        act_limit = float("inf") if act_limit is None else act_limit
++        out = fused_experts_decode_nvfp4_split(
++            hidden_states, *cache.bank_views(), topk_weights, topk_ids, miss, ev,
++            self.activation, self.apply_router_weight_on_input, act_alpha, act_limit,
++        )
++        # the plan buffers (evict_slots/src_indices) are reused by the next ensure on
++        # the main stream, which is already ordered after ev by phase B's wait.
++        if pf is not None and not _SPEC_EARLY:
 +            pf.launch(self.layer_id, hidden_states)
 +        return out
 +
@@ -196,7 +277,7 @@
  
      def _decode_hybrid(
          self,
-@@ -380,9 +499,71 @@
+@@ -380,21 +578,99 @@
          """Prefill movement: stream whole layers -- double-buffered behind the
          previous layer's GEMMs when ``prefill_overlap`` is on, else a synchronous
          ``materialize_layer``. In both, position == expert id, so the routing ids
@@ -211,11 +292,9 @@
 +        this path (begin_prefill is layer-driven), so the two paths cannot mix state."""
          cache = self.offload_cache
          assert cache is not None
-+        # Depth guard: the on-demand gather allocates fresh per-expert slabs (up to
-+        # ~230 experts x 12.6 MB). At shallow depth that rides inside the margin, but a
-+        # deep-context tail chunk lands ON TOP of the deep-prefill transients (indexer
-+        # scores, hc fp32) and OOMs the scheduler. Past the depth cap, stream instead:
-+        # zero fresh allocation, ~1s slower TTFT only for deep extends.
+-        if cache.prefill_overlap:
+-            views = self._wait_prefill_overlap(cache)
+-            out = self._expert_gemm(
 +        if (
 +            0 < _PREFILL_ONDEMAND_TOKENS
 +            and hidden_states.shape[0] <= _PREFILL_ONDEMAND_TOKENS
@@ -232,6 +311,7 @@
 +
 +            uniq, inv = torch.unique(topk_ids, return_inverse=True)
 +            u = uniq.numel()
++            staging = cache.ondemand_staging(u)  # borrowed mode invalidates buffer 0 first
 +            gid = (self.layer_id * cache.num_experts + uniq).long()
 +            slots = cache.slot_for_id.view(-1)[gid]  # >=0 resident (pure read)
 +            hit = slots >= 0
@@ -244,7 +324,7 @@
 +            for _bi, (per_layer, slab) in enumerate(cache.banks):
 +                # persistent staging slice (see offload_cache.set_bank_sources): a
 +                # per-call torch.empty here spiked ~3 GB and OOMed deep-context serving
-+                tmp = cache._ondemand_staging[_bi][:u]
++                tmp = staging[_bi]
 +                if hpos.numel():
 +                    # torch index ops lack Float8 kernels; route through a byte view.
 +                    if tmp.dtype in (torch.float8_e4m3fn, torch.float8_e8m0fnu):
@@ -257,15 +337,51 @@
 +                    fast_index_copy_jit(tmp, mpos, per_layer[self.layer_id], mids, nmiss)
 +                views.append(tmp)
 +            return self._expert_gemm(
-+                cache,
-+                hidden_states,
-+                topk_weights,
+                 cache,
+                 hidden_states,
+                 topk_weights,
+-                topk_ids,
+-                views=views,
+-                n=self.num_experts,
+-                alphas=cache.alphas_for_layer(self.layer_id),
 +                inv.to(topk_ids.dtype).view_as(topk_ids),
 +                views=tuple(views),
 +                n=u,
 +                alphas=None,
-+                is_prefill=True,
-+            )
-         if cache.prefill_overlap:
-             views = self._wait_prefill_overlap(cache)
-             out = self._expert_gemm(
+                 is_prefill=True,
+             )
++        if cache.prefill_overlap:
++            if self.layer_id == 0:
++                cache.b12x_prefill_begin(
++                    _B12X_PREFILL > 0 and hidden_states.shape[0] >= _B12X_PREFILL
++                    and cache.quant_format == "nvfp4" and self.activation == "silu"
++                    and not self.apply_router_weight_on_input
++                )
++            views = self._wait_prefill_overlap(cache)
++            if cache._b12x_prefill_on:
++                # the buffer was repacked to the b12x layout on the copy stream
++                from freetoken.kernel.b12x_repack import b12x_views
++                from freetoken.moe.nvfp4_backends import b12x_fused_experts
++
++                H = hidden_states.shape[1]
++                I = views[3].shape[2] * 2
++                gq, gs, dq, ds = b12x_views(views, H, I)
++                a1, a2 = cache.b12x_alphas(self.layer_id)
++                out = b12x_fused_experts(
++                    hidden_states, gq, gs, a1, dq, ds, a2,
++                    topk_weights, topk_ids, self.activation, False,
++                )
++            else:
++                out = self._expert_gemm(
++                    cache,
++                    hidden_states,
++                    topk_weights,
++                    topk_ids,
++                    views=views,
++                    n=self.num_experts,
++                    alphas=cache.alphas_for_layer(self.layer_id),
++                    is_prefill=True,
++                )
+             cache.release_prefill_layer(self.layer_id)
+             return out
+         cache.materialize_layer(self.layer_id)

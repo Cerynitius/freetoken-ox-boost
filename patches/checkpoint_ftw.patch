@@ -8,18 +8,17 @@
  import math
  import mmap
  import os
-@@ -43,8 +42,10 @@
+@@ -43,7 +42,9 @@
  
  import torch
  
 -logger = logging.getLogger(__name__)
 +from freetoken.utils import init_logger
- 
-+logger = init_logger(__name__)
 +
++logger = init_logger(__name__)
+ 
  INDEX_NAME = "freetoken_weight.json"
  FORMAT_TAG = "freetoken_weight"
- FORMAT_VERSION = 1
 @@ -68,18 +69,19 @@
  def _pread_into(fd: int, mv: memoryview, offset: int) -> None:
      """POSIX positional read into ``mv`` at ``offset``, looping over any short preadv.

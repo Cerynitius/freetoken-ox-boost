@@ -6,7 +6,7 @@
  
  The engine consults this at MoE-backend *auto* resolution (``engine.py``) to make the
  offload-vs-hybrid choice hardware-adaptive without importing the (torch-heavy) benchmark
-@@ -31,12 +31,44 @@
+@@ -31,10 +31,42 @@
  }
  
  
@@ -16,8 +16,8 @@
      cache = os.environ.get("XDG_CACHE_HOME") or os.path.expanduser("~/.cache")
 -    return os.path.join(cache, "freetoken", "benchbw.json")
 +    return os.path.join(cache, "freetoken")
- 
- 
++
++
 +def default_profile_path(gpu_uuid: str | None = None) -> str:
 +    """``$XDG_CACHE_HOME/freetoken/benchbw/<gpu-uuid>.json``, or the legacy ``benchbw.json`` without a uuid.
 +
@@ -49,11 +49,9 @@
 +        return newest[1]
 +    legacy = default_profile_path()
 +    return legacy if os.path.isfile(legacy) else None
-+
-+
+ 
+ 
  def _load(path: str) -> dict | None:
-     try:
-         with open(path) as f:
 @@ -45,14 +77,28 @@
          return None
  

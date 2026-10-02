@@ -8,7 +8,23 @@
      KEEPALIVE,
      ContentDelta,
      GenDone,
-@@ -148,7 +149,7 @@
+@@ -130,9 +131,13 @@
+         if request is not None:
+             events = state.stream_with_cancellation(events, request, uid)
+         return StreamingResponse(events, media_type="text/event-stream")
+-
++    _watch = state.watch_disconnect(request, uid) if hasattr(state, 'watch_disconnect') else None
+     try:
+-        result = await generate_full(uid, spec, state, source="/v1/messages")
++        try:
++            result = await generate_full(uid, spec, state, source="/v1/messages")
++        finally:
++            if _watch is not None:
++                _watch.cancel()
+     except GenerationError as exc:
+         return _anthropic_error_response(400, "invalid_request_error", str(exc))
+     response = anthropic_full_response(result, req.model, uid, cache_report=cache_report)
+@@ -148,7 +153,7 @@
      # a checkpoint whose chat template raises ValueError is a server fault, not a bad request,
      # so it must not fall into the convert/empty-prompt ValueError branch.
      try:
@@ -17,7 +33,7 @@
              req, reasoning_parser=getattr(state.config, "reasoning_parser", None)
          )
      except ValueError as exc:
-@@ -214,8 +215,19 @@
+@@ -214,8 +219,19 @@
                  # -> reasoning_content; redacted_thinking stays skipped (opaque payload).
                  thinking_parts.append(block.thinking)
              elif block.type == "image":
@@ -39,7 +55,7 @@
              elif block.type == "tool_use":
                  tool_calls.append(
                      {
-@@ -296,7 +308,8 @@
+@@ -296,7 +312,8 @@
          elif req.thinking.get("type") == "disabled":
              ctk = thinking_toggle_kwargs(False)
  
@@ -49,7 +65,7 @@
  
  
  def convert_anthropic_to_genspec(
-@@ -304,11 +317,12 @@
+@@ -304,11 +321,12 @@
      model_sampling: dict[str, Any],
      reasoning_parser: str | None = None,
  ) -> GenSpec:

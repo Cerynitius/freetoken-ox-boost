@@ -68,3 +68,54 @@ def fused_route(
         num_warps=4,
     )
     return w, ids
+
+
+@triton.jit
+def _fused_route_ext_kernel(
+    logits_ptr, bias_ptr, w_ptr, id_ptr, rank_id_ptr, rank_sc_ptr,
+    stride_lm, scaling,
+    E: tl.constexpr, TOPK: tl.constexpr, NRANK: tl.constexpr, RENORM: tl.constexpr,
+    BLOCK: tl.constexpr,
+):
+    """``_fused_route_kernel`` (sigmoid) plus the ranked list the soft cache policy
+    feeds on: the top-NRANK ids by selection score with their raw sigmoid scores
+    (ranks < TOPK are exactly the selected experts, same order and tie-break)."""
+    m = tl.program_id(0)
+    offs = tl.arange(0, BLOCK)
+    mask = offs < E
+    lg = tl.load(logits_ptr + m * stride_lm + offs, mask=mask, other=0.0).to(tl.float32)
+    sc = tl.sigmoid(lg)
+    bias = tl.load(bias_ptr + offs, mask=mask, other=0.0).to(tl.float32)
+    s4c = tl.where(mask, sc + bias, float("-inf"))
+    wsum = 0.0
+    for k in tl.static_range(NRANK):
+        idx = tl.argmax(s4c, axis=0)
+        val = tl.sum(tl.where(offs == idx, sc, 0.0), axis=0)
+        tl.store(rank_id_ptr + m * NRANK + k, idx.to(tl.int32))
+        tl.store(rank_sc_ptr + m * NRANK + k, val)
+        if k < TOPK:
+            tl.store(id_ptr + m * TOPK + k, idx.to(tl.int32))
+            tl.store(w_ptr + m * TOPK + k, val)
+            wsum += val
+        s4c = tl.where(offs == idx, float("-inf"), s4c)
+    for k in tl.static_range(TOPK):
+        v = tl.load(w_ptr + m * TOPK + k)
+        if RENORM:
+            v = v / (wsum + 1e-20)
+        tl.store(w_ptr + m * TOPK + k, v * scaling)
+
+
+def fused_route_ranked(logits, bias, top_k: int, renorm: bool, scaling: float, n_rank: int = 16):
+    """Same routing result as ``fused_route`` (sigmoid) + (rank_ids, rank_scores)
+    [M, n_rank] for the score-aware expert-cache policy."""
+    M, E = logits.shape
+    w = torch.empty(M, top_k, dtype=torch.float32, device=logits.device)
+    ids = torch.empty(M, top_k, dtype=torch.int32, device=logits.device)
+    rid = torch.empty(M, n_rank, dtype=torch.int32, device=logits.device)
+    rsc = torch.empty(M, n_rank, dtype=torch.float32, device=logits.device)
+    _fused_route_ext_kernel[(M,)](
+        logits, bias, w, ids, rid, rsc, logits.stride(0), scaling,
+        E=E, TOPK=top_k, NRANK=n_rank, RENORM=renorm, BLOCK=triton.next_power_of_2(E),
+        num_warps=4,
+    )
+    return w, ids, rid, rsc

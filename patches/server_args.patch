@@ -23,7 +23,27 @@
      def _infer_tool_call_parser(model_path: str) -> str:
          try:
              from freetoken.utils import cached_load_hf_config
-@@ -222,6 +231,16 @@
+@@ -154,6 +163,10 @@
+             return "glm47"
+         if "mistral" in marker:
+             return "mistral"
++        if "naive_n05" in marker or "naive-n0.5" in marker:
++            # Naive-N0.5-Flash's template emits Qwen3-Coder XML tool calls
++            # (<tool_call><function=..><parameter=..>); llama3 left them unparsed.
++            return "qwen3_coder"
+         return "llama3"
+ 
+     def _infer_reasoning_parser(model_path: str) -> str | None:
+@@ -181,6 +194,8 @@
+             return "deepseekv32"
+         if "qwen3" in marker or "qwen3.5" in marker or "qwen3_5" in marker:
+             return "qwen3"
++        if "naive_n05" in marker or "naive-n0.5" in marker:
++            return "qwen3"  # <think>...</think>
+         if "glm" in marker:
+             return "glm"
+         # M3 first ("minimax" is a substring): <mm:think> tags + 3 thinking gears,
+@@ -222,6 +237,16 @@
      )
  
      parser.add_argument(
@@ -40,7 +60,25 @@
          "--max-running-requests",
          type=int,
          dest="max_running_req",
-@@ -529,10 +548,13 @@
+@@ -508,6 +533,17 @@
+     )
+ 
+     parser.add_argument(
++        "--swa-num-tokens",
++        dest="swa_num_pages_override",
++        type=int,
++        default=None,
++        help=(
++            "Pin the SWA window pool to this many tokens (page_size 1) instead of "
++            "swa_full_tokens_ratio x the full pool. Must cover one prefill chunk + window."
++        ),
++    )
++
++    parser.add_argument(
+         "--moe-cache-policy",
+         default=ServerArgs.moe_cache_policy,
+         choices=["lru"],
+@@ -529,10 +565,13 @@
          type=str,
          default=ServerArgs.moe_cpu_layers,
          help=(
@@ -58,7 +96,7 @@
          ),
      )
  
-@@ -608,6 +630,15 @@
+@@ -608,6 +647,15 @@
      # Parse arguments
      kwargs = parser.parse_args(args).__dict__.copy()
  

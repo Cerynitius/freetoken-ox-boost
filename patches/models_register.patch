@@ -1,6 +1,6 @@
 --- a/python/freetoken/models/register.py
 +++ b/python/freetoken/models/register.py
-@@ -122,6 +122,11 @@
+@@ -122,6 +122,18 @@
          "freetoken.models.glm_moe_dsa",
          "GlmMoeDsaForCausalLM",
      ),
@@ -8,6 +8,13 @@
 +    "Glm5NextForConditionalGeneration": ModelSpec(
 +        "freetoken.models.glm5_next",
 +        "Glm5NextForCausalLM",
++    ),
++    # Naive-N0.5-Flash (model_type naive_n05_flash): GQA (K 192 / V 128) with 40 SWA-128
++    # layers (+sinks) and 8 DSA layers (token top-2048 lightning indexer); sigmoid/noaux_tc
++    # NVFP4 routed experts served from the offload cache.
++    "NaiveN05FlashForCausalLM": ModelSpec(
++        "freetoken.models.naive_n05",
++        "NaiveN05ForCausalLM",
 +    ),
  }
  

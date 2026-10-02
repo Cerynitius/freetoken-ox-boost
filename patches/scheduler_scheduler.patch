@@ -17,25 +17,111 @@
  
          # initialize other managers
          self.table_manager = TableManager(config.max_running_req, self.engine.page_table)
-@@ -83,6 +86,13 @@
-                 (g.sliding_window for g in config.model_config.kv_cache_group_specs() if g.is_swa),
+@@ -84,9 +87,21 @@
                  None,
              ) or getattr(self.engine.kv_cache, "sliding_window_size", None),
-+        )
+         )
 +        # KDA (glm5_next) has no track-snapshot writer yet: without this gate its frozen
 +        # ping-pong donates would put UNWRITTEN all-zero states into the radix tree and
 +        # every prefix hit would restore zero recurrent state (full-attention layers then
 +        # carry the prefix alone -- usually survivable, intermittently wrong).
 +        self.cache_manager.gdn_track_snapshots = getattr(
 +            config.model_config, "gdn_track_snapshots", True
-         )
++        )
++        if getattr(self.engine, "elastic", None) is not None:
++            self.cache_manager.attach_elastic(self.engine.elastic)
          self.decode_manager = DecodeManager(config.page_size)
          self.prefill_manager = PrefillManager(
-@@ -486,6 +496,106 @@
+-            self.cache_manager, self.table_manager, self.decode_manager
++            self.cache_manager, self.table_manager, self.decode_manager,
++            image_token_id=getattr(
++                getattr(self.engine.model, "config", None), "image_token_id", None
++            ),
+         )
+ 
+         # some alias for easy access
+@@ -142,6 +157,60 @@
+         """Called when the scheduler is idle to perform background tasks."""
+         logger.info_rank0("Scheduler is idle, waiting for new reqs...")
+         self.cache_manager.check_integrity()
++        el = getattr(self.engine, "elastic", None)
++        if el is not None and el.steps > 1 and self.tp_cpu_group.size() == 1:
++            # grown KV: give the bytes back to the expert cache. Capacity no live request
++            # has needed for evict_after_s is reclaimed at once (evicting prefix cache LRU);
++            # otherwise wait idle_s and shrink only as far as compaction allows.
++            import time as _t
++
++            q = self._recv_from_tokenizer
++            evict = el.top_step_unneeded()
++            if not evict:
++                t0 = _t.monotonic()
++                while _t.monotonic() - t0 < el.idle_s and q.empty():
++                    _t.sleep(0.05)
++            if q.empty():
++                with torch.inference_mode(), torch.cuda.stream(self.engine.stream):
++                    while el.steps > 1 and el.shrink(self.cache_manager, allow_evict=evict):
++                        pass
++
++    def _elastic_busy_shrink(self, ongoing_data: "ForwardData | None" = None) -> None:
++        """Elastic KV under continuous load: once the grown capacity has gone unneeded by
++        any live request for evict_after_s, shrink at this safe point (between batches)
++        unless a LIVE request's page-table row references a slot of the top step (running
++        decodes + partially prefilled chunked requests pin their rows [:device_len],
++        including the tree prefix they matched). Tree-only KV there is compacted down
++        (evicting LRU prefix cache only if it does not fit)."""
++        el = getattr(self.engine, "elastic", None)
++        if el is None or el.steps <= 1 or not el.top_step_unneeded():
++            return
++        import time as _t
++
++        now = _t.monotonic()
++        if now - getattr(el, "_busy_try", 0.0) < 15.0:
++            return
++        el._busy_try = now
++        lo = (el.steps - 1) * el.step
++        hi = lo + el.step
++        live = list(self.decode_manager.running_reqs) + [
++            p.chunked_req for p in self.prefill_manager.pending_list if p.chunked_req is not None
++        ]
++        # Overlap mode: _forward's filter_reqs already dropped requests whose LAST step is in
++        # the batch just launched (length-capped decodes, max_tokens=1 prefills); they are
++        # only cached/freed by the next _process_last_data, so their rows still hold slots.
++        if ongoing_data is not None:
++            live += [r for r in ongoing_data[0].batch.reqs if r.table_idx >= 0]
++        for r in live:
++            # spec decoding pre-allocates [device_len, spec_alloc_len)
++            s = self.engine.page_table[r.table_idx, : max(r.device_len, r.spec_alloc_len)]
++            if bool(((s >= lo) & (s < hi)).any()):
++                return
++        torch.cuda.synchronize(self.engine.device)
++        with torch.inference_mode(), torch.cuda.stream(self.engine.stream):
++            if el.shrink(self.cache_manager, allow_evict=True):
++                # the new top step starts its own evict_after_s window (no 15 s cascade)
++                el.top_needed_ts = now
+ 
+     @torch.inference_mode()
+     def rebuild_cache(
+@@ -245,6 +314,7 @@
+         self.stream.wait_stream(self.engine.stream)
+         self._process_last_data(last_data)
+         self._flush_abort_acks()
++        self._elastic_busy_shrink(ongoing_data)
+         return ongoing_data
+ 
+     def normal_loop(self) -> None:
+@@ -273,6 +343,7 @@
+ 
+         self._process_last_data(ongoing_data)
+         self._flush_abort_acks()
++        self._elastic_busy_shrink()
+ 
+     @torch.inference_mode()
+     def run_forever(self) -> NoReturn:
+@@ -486,6 +557,106 @@
                      "Dropping request %d because its abort arrived before admission", msg.uid
                  )
                  return
-+            _img_tid = getattr(self.engine.model.config, "image_token_id", None)
++            _img_tid = getattr(getattr(self.engine.model, "config", None), "image_token_id", None)
 +            if _img_tid is not None and not getattr(msg, "mm_images", None):
 +                # mm-forensic: a prompt carrying image placeholders MUST arrive with
 +                # pixel payloads; if not, its span would enter the prefix cache as raw
@@ -83,7 +169,7 @@
 +                    # SAME image become prefix-cache hits; different images diverge at the
 +                    # span's first token, so cross-image reuse is impossible.
 +                    image_token_id = getattr(
-+                        self.engine.model.config, "image_token_id", None
++                        getattr(self.engine.model, "config", None), "image_token_id", None
 +                    )
 +                    if image_token_id is not None:
 +                        import hashlib
@@ -138,7 +224,7 @@
              input_len, max_seq_len = len(msg.input_ids), self.engine.max_seq_len
              max_output_len = max_seq_len - input_len
              if max_output_len <= 0:
-@@ -586,8 +696,28 @@
+@@ -586,8 +757,28 @@
          pool = self.engine.linear_state_pool
          if pool is None or not batch.is_prefill:
              return
@@ -166,4 +252,37 @@
 +                    )
                  pool.copy_from(req.mamba_restore_src, req.linear_slot_idx)
                  req.mamba_restore_src = None  # consumed: restore exactly once
+ 
+@@ -827,16 +1018,28 @@
+ 
+     def _schedule_next_batch(self) -> ForwardInput | None:
+         # TODO: support other policies: e.g. DECODE first
+-        batch = (
+-            self.prefill_manager.schedule_next_batch(self.prefill_budget)
+-            or self.decode_manager.schedule_next_batch()
+-        )
++        batch = self.prefill_manager.schedule_next_batch(self.prefill_budget)
++        if getattr(self.prefill_manager, "rejected", None):
++            self._reply_prefill_rejections()
++        batch = batch or self.decode_manager.schedule_next_batch()
+         if batch is None:
+             return None
+         forward_input = self._prepare_batch(batch)
+         self._report_prompt_admissions(batch)
+         return forward_input
+ 
++    def _reply_prefill_rejections(self) -> None:
++        """Finish the requests the prefill pass refused (a multimodal prompt that can never
++        be prefilled: see PrefillAdder._add_one_req) with a per-request error, the same
++        terminal ErrorReplyMsg path as an over-long prompt. They were dropped from the queue
++        before any budget/pool mutation, hold no resources, and were never admitted."""
++        rejected, self.prefill_manager.rejected = self.prefill_manager.rejected, []
++        for uid, error, _code in rejected:
++            logger.warning_rank0(f"request {uid} rejected at prefill admission: {error}")
++        self.send_result(
++            [ErrorReplyMsg(uid=uid, error=error, code=code) for uid, error, code in rejected]
++        )
++
+     def _report_prompt_admissions(self, batch: Batch) -> None:
+         """Publish first-prefill accounting only after batch preparation succeeded.
  

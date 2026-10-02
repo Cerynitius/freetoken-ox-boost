@@ -25,6 +25,12 @@
   gather/scatter are ``index_select``/``index_copy_`` on a FIXED-ADDRESS index buffer
   (``fla.cache_indices``) with capture-static shapes -- replays read the refreshed index
   values, same contract the vendored slot-indexed kernels rely on.
+
+  Opt-in (``FREETOKEN_GLM5_KDA_INPLACE=1``, default off): plain DECODE skips the
+  gather/scatter and lets the same fla recurrent kernel read/write ``rec[cache_indices]``
+  in place (fla's continuous-batching mode, ``_fused_recurrent_kda_inplace``) -- the
+  contract the Qwen3.5 GDN decode already uses. Prefill, spec-verify and spec_commit
+  keep the gather/scatter path.
 """
 
 from __future__ import annotations
@@ -43,6 +49,91 @@ from freetoken.models.qwen3_5_moe.gdn import _DepthwiseConv1d
 
 # Full (MLA + DSA) layers: ModelConfig.glm_dsa_args carries the derived GlmMoeDsaArgs.
 FullAttention = GlmMoeDsaAttention
+
+# ---- opt-in in-place KDA decode (FREETOKEN_GLM5_KDA_INPLACE=1; default OFF) ----------
+_KDA_INPLACE_ENV = "FREETOKEN_GLM5_KDA_INPLACE"
+_kda_inplace_logged = False
+
+
+def _kda_inplace_requested() -> bool:
+    return _os.environ.get(_KDA_INPLACE_ENV, "0") == "1"
+
+
+def _kda_inplace_reject(
+    rec: torch.Tensor, idx: torch.Tensor, cu_seqlens: torch.Tensor | None,
+    n_tok: int, num_heads: int, head_dim: int,
+) -> str | None:
+    """Host-side (shape/dtype/stride only: no sync, capture-safe) preconditions of the
+    in-place decode. Returns None when safe, else the reason (caller falls back)."""
+    if rec.dtype != torch.float32:
+        return f"state pool dtype {rec.dtype} (bit-exactness argued for fp32 only)"
+    if not rec.is_contiguous():
+        return "state pool not contiguous (a .contiguous() copy would drop the write)"
+    if tuple(rec.shape[1:]) != (num_heads, head_dim, head_dim):
+        return f"state pool slot shape {tuple(rec.shape[1:])} != [H, K, V]"
+    if idx.dim() != 1 or idx.shape[0] != n_tok or idx.dtype not in (torch.int32, torch.int64):
+        return f"cache_indices {tuple(idx.shape)}/{idx.dtype} vs {n_tok} decode tokens"
+    if cu_seqlens is None or cu_seqlens.shape[0] != n_tok + 1:
+        return "cu_seqlens is not [B+1] (decode must be one token per sequence)"
+    return None
+
+
+def _kda_inplace_log_once(why: str | None) -> None:
+    """One line per process so the A/B arm is visible in the server log."""
+    global _kda_inplace_logged
+    if _kda_inplace_logged:
+        return
+    _kda_inplace_logged = True
+    from freetoken.utils import init_logger
+
+    if why is None:
+        init_logger(__name__).info("KDA decode: in-place recurrent state (%s=1)", _KDA_INPLACE_ENV)
+    else:
+        init_logger(__name__).warning(
+            "KDA decode: %s=1 but falling back to gather/scatter: %s", _KDA_INPLACE_ENV, why)
+
+
+def _fused_recurrent_kda_inplace(
+    q: torch.Tensor, k: torch.Tensor, v: torch.Tensor,
+    g: torch.Tensor, beta: torch.Tensor, *,
+    state_pool: torch.Tensor, slot_indices: torch.Tensor,
+    cu_seqlens: torch.Tensor, scale: float,
+) -> torch.Tensor:
+    """One KDA decode step whose recurrent state is read from AND written back to
+    ``state_pool[slot_indices[i]]`` by the kernel itself -- no gather / scatter copies.
+
+    The public ``fla.ops.kda.fused_recurrent_kda`` hard-codes ``inplace_final_state=False``
+    and requires ``initial_state.shape[0] == N``, so this calls the lower-level
+    ``fused_recurrent_kda_fwd`` (same Triton kernel) with ``ssm_state_indices`` +
+    ``inplace_final_state=True``. Per-element math is unchanged; only the address of
+    h0 / ht differs (slot base instead of the dense gathered row).
+
+    Contract (validated by ``_kda_inplace_reject`` + decode metadata construction):
+      * exactly ONE token per sequence (cu_seqlens == arange(B+1)). With 1-D indices the
+        kernel stores token t's state at ``slot_indices[i_n + t]``; T > 1 would clobber the
+        next row's slot.
+      * ``state_pool`` contiguous fp32 [slots, H, K, V] (K-major, ``state_v_first=False``),
+        deliberately NOT passed through ``.contiguous()``.
+      * real rows carry distinct slots (the same invariant the index_copy_ scatter needs);
+        padded rows may share the scratch padding slot.
+    q/k/v/g/beta and cu_seqlens get the same ``.contiguous()`` + device context that the
+    public wrapper's ``@input_guard`` applies. Returns ``o`` [1, B, H, V]."""
+    from fla.ops.kda.fused_recurrent import fused_recurrent_kda_fwd
+    from fla.utils import custom_device_ctx
+
+    with custom_device_ctx(q.device.index):
+        o, _ = fused_recurrent_kda_fwd(
+            q=q.contiguous(), k=k.contiguous(), v=v.contiguous(),
+            g=g.contiguous(), beta=beta.contiguous(),
+            initial_state=state_pool,
+            scale=scale,
+            output_final_state=True,
+            inplace_final_state=True,
+            cu_seqlens=cu_seqlens.contiguous(),
+            ssm_state_indices=slot_indices,
+            use_qk_l2norm_in_kernel=True,
+        )
+    return o
 
 
 class _SigmoidGatedRMSNorm(BaseOP):
@@ -258,20 +349,39 @@ class KdaAttention(BaseOP):
             q = qf.reshape(1, B, self.num_heads, self.head_dim).to(dtype)
             k = kf.reshape(1, B, self.num_heads, self.head_dim).to(dtype)
             v = vf.reshape(1, B, self.num_heads, self.head_dim).to(dtype)
-            state = rec.index_select(0, idx_l)  # gather (fixed-address idx buffer: graph-safe)
-            core, state = fused_recurrent_kda(
-                q=q, k=k, v=v,
-                g=g.view(1, B, self.num_heads, self.head_dim),
-                beta=beta.view(1, B, self.num_heads),
-                scale=self.head_dim ** -0.5,
-                initial_state=state, output_final_state=True,
-                use_qk_l2norm_in_kernel=True,
-                # varlen: B one-token sequences (cu_seqlens = arange(B+1)); without this the
-                # kernel would treat the batch as ONE sequence of B timesteps and return a
-                # single merged state (caught by the bs=2 graph-capture regression).
-                cu_seqlens=fla_md.cu_seqlens,
-            )
-            rec.index_copy_(0, idx_l, state.to(rec.dtype))  # scatter back
+            inplace = False
+            if _kda_inplace_requested():
+                why = _kda_inplace_reject(
+                    rec, idx, fla_md.cu_seqlens, B, self.num_heads, self.head_dim)
+                _kda_inplace_log_once(why)
+                inplace = why is None
+            if inplace:
+                # Kernel reads h0 at rec[idx[i]] and stores ht at the same address (one
+                # token per row); padded rows all hit the scratch padding slot, exactly
+                # like the conv-state update above and the index_copy_ scatter below.
+                core = _fused_recurrent_kda_inplace(
+                    q, k, v,
+                    g.view(1, B, self.num_heads, self.head_dim),
+                    beta.view(1, B, self.num_heads),
+                    state_pool=rec, slot_indices=idx, cu_seqlens=fla_md.cu_seqlens,
+                    scale=self.head_dim ** -0.5,
+                )
+            else:
+                state = rec.index_select(0, idx_l)  # gather (fixed-address idx buffer: graph-safe)
+                core, state = fused_recurrent_kda(
+                    q=q, k=k, v=v,
+                    g=g.view(1, B, self.num_heads, self.head_dim),
+                    beta=beta.view(1, B, self.num_heads),
+                    scale=self.head_dim ** -0.5,
+                    initial_state=state, output_final_state=True,
+                    use_qk_l2norm_in_kernel=True,
+                    # varlen: B one-token sequences (cu_seqlens = arange(B+1)); without this
+                    # the kernel would treat the batch as ONE sequence of B timesteps and
+                    # return a single merged state (caught by the bs=2 graph-capture
+                    # regression).
+                    cu_seqlens=fla_md.cu_seqlens,
+                )
+                rec.index_copy_(0, idx_l, state.to(rec.dtype))  # scatter back
         else:
             if fla_md.fresh_state_indices is not None:
                 rec.index_fill_(0, fla_md.fresh_state_indices, 0.0)

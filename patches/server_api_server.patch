@@ -1,6 +1,14 @@
 --- a/python/freetoken/server/api_server.py
 +++ b/python/freetoken/server/api_server.py
-@@ -174,6 +174,8 @@
+@@ -39,6 +39,7 @@
+ from .anthropic_api import register_anthropic_routes
+ from .accounting import AdmissionClosedError, register_accounting_routes
+ from .control_api import register_control_routes
++from .generation import FORCE_TEMPERATURE
+ from .openai_api import register_openai_routes
+ from . import request_ring
+ from .access_log_filter import install_polling_access_log_filter
+@@ -174,6 +175,8 @@
      # "num_mamba_slots"}, from the same ack. Seeds geometry before the first generation reply
      # (the running snapshot channel) has anything. None until meta arrives.
      cache_pools: Dict[str, int] | None = None
@@ -9,7 +17,147 @@
      # Backend worker Process handles (TP schedulers + tokenizer/detokenizer), captured from the
      # BackendHandle after start_backend(). The orderly-shutdown path (lifespan / shell signal
      # handler) tears these down itself, AFTER setting _SHUTTING_DOWN, so the supervisor observes
-@@ -1010,6 +1012,7 @@
+@@ -331,7 +334,9 @@
+                 await event.wait()
+                 event.clear()
+ 
+-                pending = self.ack_map[uid]
++                pending = self.ack_map.get(uid)
++                if pending is None:  # aborted (client gone): end the stream
++                    break
+                 self.ack_map[uid] = []
+                 ack = None
+                 for ack in pending:
+@@ -354,6 +359,37 @@
+         logger.debug("Finished streaming response for user %s", uid)
+ 
+     async def stream_with_cancellation(self, generator, request: Request, uid: int):
++        # A real client disconnect usually reaches this generator as aclose()
++        # (GeneratorExit at the suspended yield), NOT CancelledError -- an
++        # except-CancelledError abort path silently misses it and the request
++        # keeps decoding server-side. finally + completion flag covers every
++        # early-termination path (CancelledError, GeneratorExit, transport
++        # errors) while skipping the abort on natural completion.
++        #
++        # With ASGI spec >= 2.4 (uvicorn >= 0.3x, Starlette >= 0.4x) a write to a dead socket
++        # raises ClientDisconnect INSIDE Starlette and the body generator is simply abandoned:
++        # neither this finally nor the per-chunk check runs, and a request that is still
++        # QUEUED (no output yet) never writes at all -- so dead clients kept decoding to their
++        # max_tokens (2026-09-29 stress: orphans held a single-stream server for hours). A
++        # watcher task polls the connection independently of the chunk flow.
++        completed = False
++        done = asyncio.Event()
++
++        async def _watch():
++            try:
++                while not done.is_set():
++                    if await request.is_disconnected():
++                        logger.info("Client disconnected for user %s", uid)
++                        await self.abort_user(uid)
++                        return
++                    try:
++                        await asyncio.wait_for(done.wait(), timeout=0.5)
++                    except asyncio.TimeoutError:
++                        pass
++            except Exception:  # noqa: BLE001
++                logger.exception("disconnect watcher failed for user %s", uid)
++
++        watcher = asyncio.create_task(_watch())
+         try:
+             async for chunk in generator:
+                 # detect if the client has disconnected
+@@ -361,19 +397,55 @@
+                     logger.info("Client disconnected for user %s", uid)
+                     raise asyncio.CancelledError
+                 yield chunk
+-        except asyncio.CancelledError:
+-            asyncio.create_task(self.abort_user(uid))
+-            raise
++            completed = True
++        finally:
++            done.set()
++            if not completed:
++                try:
++                    await asyncio.shield(self.abort_user(uid))
++                except Exception:  # noqa: BLE001
++                    logger.exception("Failed to deliver abort for user %s", uid)
++            watcher.cancel()
++
++    def watch_disconnect(self, request, uid: int):
++        """Non-stream requests: abort the generation if the client goes away (the endpoint
++        coroutine otherwise waits for the full max_tokens). Returns the task to cancel."""
++        async def _w():
++            try:
++                while True:
++                    if await request.is_disconnected():
++                        logger.info("Client disconnected for user %s (non-stream)", uid)
++                        await self.abort_user(uid)
++                        return
++                    await asyncio.sleep(0.5)
++            except asyncio.CancelledError:
++                pass
++            except Exception:  # noqa: BLE001
++                logger.exception("disconnect watcher failed for user %s", uid)
++
++        return asyncio.create_task(_w()) if request is not None else None
+ 
+     async def abort_user(self, uid: int):
+-        await asyncio.sleep(0.1)
+-        if uid in self.ack_map:
+-            del self.ack_map[uid]
+-        if uid in self.event_map:
+-            del self.event_map[uid]
++        # Always deliver the abort, and deliver it BEFORE waking the request's waiter. The two
++        # callers used to lose it (2026-09-29, dead clients decoded to max_tokens on a
++        # single-stream server): a cancelled stream unwinds wait_for_ack's finally first, which
++        # pops event_map, so a presence check saw "not claimed" and returned; and the
++        # non-stream endpoint cancels its watcher task (running this coroutine) as soon as
++        # generate_full wakes, i.e. during the old pre-send sleep. The scheduler treats an
++        # abort for a finished or unknown uid as a no-op (tombstone + ack).
++        done = self.__dict__.setdefault("_aborted_uids", {})
++        if uid in done:
++            return
++        done[uid] = None
++        while len(done) > 4096:
++            done.pop(next(iter(done)))
++        event = self.event_map.pop(uid, None)
++        self.ack_map.pop(uid, None)
+         self.stats.on_abort(uid)
+         logger.warning("Aborting request for user %s", uid)
+         await self.send_one(AbortMsg(uid=uid))
++        if event is not None:
++            event.set()  # wake a waiter parked in wait_for_ack so it ends instead of hanging
+ 
+     def shutdown(self):
+         self.send_tokenizer.stop()
+@@ -441,7 +513,8 @@
+     return getattr(cfg, "served_model_name", None)
+ 
+ 
+-@app.middleware("http")
++# TEMP-EXPERIMENT: BaseHTTPMiddleware suspected of blocking disconnect propagation
++# @app.middleware("http")
+ async def _record_request_middleware(request: Request, call_next):
+     """Time every generation request into the ring for /v1/requests + /v1/stats p95. Single-
+     model server, so model = served_model_name; stream is inferred from the response media
+@@ -833,6 +906,7 @@
+             sampling_params=SamplingParams(
+                 ignore_eos=req.ignore_eos,
+                 max_tokens=req.max_tokens,
++                temperature=FORCE_TEMPERATURE if FORCE_TEMPERATURE is not None else 0.0,
+             ),
+         )
+     )
+@@ -939,6 +1013,8 @@
+         _MODEL_SAMPLING.get("top_k", -1),
+         _MODEL_SAMPLING.get("top_p", 1.0),
+     )
++    if FORCE_TEMPERATURE is not None:
++        logger.info("FREETOKEN_FORCE_TEMPERATURE=%s: every request samples at this temperature", FORCE_TEMPERATURE)
+ 
+     if run_shell:
+         assert not config.use_dummy_weight, "Shell mode does not support dummy weights."
+@@ -1010,6 +1086,7 @@
          _GLOBAL_STATE.cache_pools = meta.pop("pools", None)
          _GLOBAL_STATE.swa_full_tokens_ratio = float(meta.pop("swa_full_tokens_ratio", 0.0) or 0.0)
          _GLOBAL_STATE.cache_budget_bytes = int(meta.pop("cache_budget_bytes", 0) or 0)

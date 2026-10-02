@@ -17,7 +17,7 @@
      template_tools: list[dict[str, Any]] | None = None   # tools the model sees (TokenizeMsg.tools)
      parser_tools: list[dict[str, Any]] | None = None     # tools for FunctionCallParser; None disables parsing
  
-@@ -151,7 +154,10 @@
+@@ -151,7 +154,16 @@
  # Default max output (decode) tokens when a request omits one. Overridable per server via
  # --max-output-tokens (the Responses adapter passes that through); clamped to the remaining
  # context by the scheduler regardless.
@@ -26,10 +26,25 @@
 +# the scheduler already clamps every request to (max_seq_len - input_len), so this
 +# just means "generate until EOS or the context is full" instead of an arbitrary cap.
 +DEFAULT_MAX_OUTPUT_TOKENS = int(_os.getenv("FREETOKEN_DEFAULT_MAX_OUTPUT_TOKENS", "262144"))
++# Server-wide temperature override: every request (all protocols and /generate) samples at this
++# value, whatever it asks for. Unset or empty = honour the request. Naive-N0.5-Flash sets 1.0
++# (its recommended value): at T<1 its reasoning falls into enumeration loops, and the official code
++# and weights, fp32 on CPU and GPU, loop the same way (2026-09-29), so this is the model, not the engine.
++_FORCE_T = _os.getenv("FREETOKEN_FORCE_TEMPERATURE", "").strip()
++FORCE_TEMPERATURE: float | None = float(_FORCE_T) if _FORCE_T else None
  
  
  def resolve_sampling(
-@@ -198,7 +204,16 @@
+@@ -180,7 +192,7 @@
+     return SamplingParams(
+         ignore_eos=ignore_eos,
+         max_tokens=DEFAULT_MAX_OUTPUT_TOKENS if max_tokens is None else max_tokens,
+-        temperature=pick(temperature, "temperature", 0.0),
++        temperature=FORCE_TEMPERATURE if FORCE_TEMPERATURE is not None else pick(temperature, "temperature", 0.0),
+         top_k=pick(top_k, "top_k", -1),
+         top_p=pick(top_p, "top_p", 1.0),
+         stop_strs=[s for s in stop_list if s],  # drop empty strings (would match everything)
+@@ -198,7 +210,16 @@
      m = dict(message)
      content = m.get("content")
      if isinstance(content, list):
@@ -47,12 +62,10 @@
      # Templates read different reasoning keys (reasoning_content: most; reasoning:
      # gemma4; thinking: gpt-oss) — accept any, emit both.
      reasoning = m.get("reasoning_content") or m.get("reasoning") or m.get("thinking")
-@@ -228,8 +243,62 @@
-             rendered.append(tc)
-         m["tool_calls"] = rendered
+@@ -230,6 +251,60 @@
      return m
-+
-+
+ 
+ 
 +def _mm_content_parts(parts: list[Any]) -> list[dict[str, Any]]:
 +    out: list[dict[str, Any]] = []
 +    for part in parts:
@@ -95,7 +108,7 @@
 +                    decode_video_part,
 +                    preprocess_video,
 +                )
- 
++
 +                frames, ts = decode_video_part(part.get("video_url") or part.get("video"))
 +                pixels, grid, unit_ts = preprocess_video(frames, ts)
 +                images.append({
@@ -105,12 +118,12 @@
 +                    "ts": [float(t) for t in unit_ts],
 +                })
 +    return images
- 
++
 +
  def _flatten_text_parts(parts: list[Any]) -> str:
      texts: list[str] = []
      for part in parts:
-@@ -269,6 +338,7 @@
+@@ -269,6 +344,7 @@
              sampling_params=spec.sampling_params,
              chat_template_kwargs=spec.chat_template_kwargs,
              tools=spec.template_tools,

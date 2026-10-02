@@ -1,0 +1,23 @@
+--- a/python/freetoken/kernel/batch_memcpy.py
++++ b/python/freetoken/kernel/batch_memcpy.py
+@@ -28,6 +28,10 @@
+     src = torch.arange(16, dtype=torch.uint8).pin_memory()
+     dst = torch.zeros(16, dtype=torch.uint8, device="cuda")
+     stream = torch.cuda.Stream()
++    # The zero-fill above is queued on the current stream; the probe runs mid-forward (first
++    # prefill) with layers of work still queued there, so without this wait the fill could land
++    # after the copy and the probe "fails" on a working binding (hit-D2D was off 09-29..10-01).
++    stream.wait_stream(torch.cuda.current_stream())
+     fn(
+         torch.tensor([dst.data_ptr()]),
+         torch.tensor([src.data_ptr()]),
+@@ -46,6 +50,9 @@
+     (12.8/12.9 had an extra failIdx parameter); gate on the torch runtime version
+     before paying for the JIT build, then verify with a real copy.
+     """
++    import os
++    if os.environ.get("FREETOKEN_BATCH_MEMCPY", "1") == "0":   # A/B switch: force the full-layer fallback
++        raise RuntimeError("cudaMemcpyBatchAsync disabled by FREETOKEN_BATCH_MEMCPY=0")
+     cuda = torch.version.cuda
+     if cuda is None or tuple(int(x) for x in cuda.split(".")[:2]) < (13, 0):
+         raise RuntimeError(f"cudaMemcpyBatchAsync binding requires CUDA >= 13.0 (torch built with {cuda})")

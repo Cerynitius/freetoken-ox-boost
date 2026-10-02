@@ -1,6 +1,19 @@
 --- a/python/freetoken/core.py
 +++ b/python/freetoken/core.py
-@@ -64,6 +64,11 @@
+@@ -28,7 +28,11 @@
+ 
+     @property
+     def is_greedy(self) -> bool:
+-        return (self.temperature <= 0.0 or self.top_k == 1) and self.top_p == 1.0
++        # temperature<=0 / top_k==1 is argmax whatever top_p says (OpenAI/vLLM semantics).
++        # Requiring top_p==1.0 here sent T=0 requests that inherited a checkpoint default
++        # top_p (--sampling-defaults model, e.g. 0.95) down the T=1e-6 sampling path, which
++        # breaks bf16 logit TIES at random -> identical T=0 requests diverged (2026-09-29).
++        return self.temperature <= 0.0 or self.top_k == 1
+ 
+ 
+ @dataclass(eq=False)
+@@ -64,6 +68,11 @@
      # handler must not free resources under an in-flight forward; it sets this flag and
      # _process_last_data frees the request when the batch drains (after copy_done.synchronize).
      aborted: bool = False

@@ -16,6 +16,8 @@ shape handling is verified by a dummy-weight forward before real weights.
 
 from __future__ import annotations
 
+import os
+
 import torch
 import torch.nn.functional as F
 from torch import nn
@@ -39,6 +41,15 @@ from .mlp import Glm5ClampedMLP
 from .moe import Glm5SparseBlock
 
 from .attention import FullAttention, KdaAttention
+
+# FREETOKEN_GLM5_HC_FUSED (decode-size calls only, total <= _HC_FUSED_MAX_TOKENS; read once
+# at import; default "0" = the original 4-launch hc_pre, unchanged):
+#   "1" LOSSLESS: hc_split_sinkhorn + hc_pre_combine -> one launch (4 -> 3 per hc_pre);
+#       bit-identical by construction (see kernel/triton/dsv4/hc_split_combine.py).
+#   "2" "1" + rms folded into the MIX gemv (DSV4 hc_pre_fused's kernel; 4 -> 2 per
+#       hc_pre). NOT bit-identical: changes the sum-of-squares AND dot reduction trees.
+_HC_FUSED = os.environ.get("FREETOKEN_GLM5_HC_FUSED", "0")
+_HC_FUSED_MAX_TOKENS = 16
 
 
 class Glm5DecoderLayer(BaseOP):
@@ -87,6 +98,8 @@ class Glm5DecoderLayer(BaseOP):
         # x: [total, hc_mult, dim] -> collapsed y: [total, dim] for the mixer.
         total = x.shape[0]
         dtype = x.dtype
+        if _HC_FUSED in ("1", "2") and total <= _HC_FUSED_MAX_TOKENS:
+            return self._hc_pre_fused(x, hc_fn, hc_scale, hc_base)
         # tail-fusion (2026-08-28): cast+square+mean+rsqrt -> one kernel; gemv with
         # rsqrt epilogue -> one kernel; pre_combine upcasts bf16 in-register (the
         # eager chain was ~7 launches + two 64KB-per-token fp32 casts per call).
@@ -97,6 +110,26 @@ class Glm5DecoderLayer(BaseOP):
         )
         y = hc_pre_combine(x.reshape(total, self.hc_mult, self.dim), pre, dtype)
         return y.reshape(total, self.dim), post, comb
+
+    def _hc_pre_fused(self, x, hc_fn, hc_scale, hc_base):
+        # FREETOKEN_GLM5_HC_FUSED=1|2 decode path; same returns as hc_pre:
+        # y [total, dim] (x.dtype), post [total, hc] fp32, comb [total, hc, hc] fp32.
+        from freetoken.kernel.triton.dsv4.hc_split_combine import (
+            hc_mix_rms,
+            hc_sinkhorn_pre_combine,
+        )
+
+        total = x.shape[0]
+        x2 = x.reshape(total, self.hc_mult * self.dim)
+        if _HC_FUSED == "2":
+            mixes = hc_mix_rms(x2, hc_fn, self.norm_eps)  # 1 launch, NOT bit-identical
+        else:
+            xf, rs = hc_rms_cast(x2, self.norm_eps)  # unchanged kernels
+            mixes = hc_mix_gemv(xf, hc_fn, rs)
+        return hc_sinkhorn_pre_combine(
+            mixes, x.reshape(total, self.hc_mult, self.dim), hc_scale, hc_base,
+            self.hc_mult, self.hc_sinkhorn_iters, self.hc_eps, x.dtype,
+        )
 
     def hc_post(self, x, residual, post, comb):
         # x: [total, dim] (mixer out); residual: [total, hc_mult, dim] -> [total, hc_mult, dim].

@@ -20,3 +20,19 @@
          sampling_params=resolve_sampling(
              temperature=req.temperature,
              top_k=req.top_k,
+@@ -197,9 +200,13 @@
+         if request is not None:
+             chunks = state.stream_with_cancellation(chunks, request, uid)
+         return StreamingResponse(chunks, media_type="text/event-stream")
+-
++    _watch = state.watch_disconnect(request, uid) if hasattr(state, 'watch_disconnect') else None
+     try:
+-        result = await generate_full(uid, spec, state, source="/v1/chat/completions")
++        try:
++            result = await generate_full(uid, spec, state, source="/v1/chat/completions")
++        finally:
++            if _watch is not None:
++                _watch.cancel()
+     except GenerationError as exc:
+         return create_error_response(str(exc), code=exc.code)
+     message: dict[str, Any] = {"role": "assistant", "content": result.content}

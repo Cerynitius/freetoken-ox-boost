@@ -1,0 +1,23 @@
+--- a/python/freetoken/attention/__init__.py
++++ b/python/freetoken/attention/__init__.py
+@@ -132,6 +132,20 @@
+     return M3SparseAttnBackend(config)
+ 
+ 
++@SUPPORTED_ATTENTION_BACKENDS.register(
++    "naive",
++    BackendInfo(
++        supported_types=frozenset({AttnType.FULL, AttnType.SWA}),
++        consumes_attn_spec=True,
++        page_sizes=(1,),
++    ),
++)
++def create_naive_backend(config: ModelConfig):
++    from .naive import NaiveAttnBackend
++
++    return NaiveAttnBackend(config)
++
++
+ def attention_backend_info(name: str) -> BackendInfo:
+     return SUPPORTED_ATTENTION_BACKENDS.info(name)
+ 

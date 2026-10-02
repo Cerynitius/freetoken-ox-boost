@@ -9,17 +9,14 @@
 +def _bench_profile_path(gpu_uuid: str | None) -> str | None:
 +    # per-GPU profiles and no torch here: the serve's own card when its --gpu names one, else the newest file
 +    from freetoken.moe.bench_profile import default_profile_path, latest_profile_path  # torch-free
- 
--    return default_profile_path()
++
 +    if gpu_uuid:
 +        path = default_profile_path(gpu_uuid)
 +        if os.path.isfile(path):
 +            return path
 +    return latest_profile_path()
- 
- 
--def _read_bench_profile() -> dict | None:
--    """The engine host's cached benchbw.json (this is where the serve reads it too), or None."""
++
++
 +def _serve_gpu_uuid(args: list[str]) -> str | None:
 +    """The full UUID a serve's `--gpu` pins, or None when there is none or it cannot be resolved."""
 +    for i, a in enumerate(args):
@@ -27,7 +24,8 @@
 +        if not val:
 +            continue
 +        from freetoken.gpu_select import resolve_gpu_uuids
-+
+ 
+-    return default_profile_path()
 +        try:
 +            resolved = resolve_gpu_uuids([val])
 +        except ValueError:
@@ -37,8 +35,10 @@
 +        # no NVML: a UUID value still keys the profile file (canonical prefix), an index cannot
 +        return "GPU-" + val[len("GPU-"):] if val.upper().startswith("GPU-") else None
 +    return None
-+
-+
+ 
+ 
+-def _read_bench_profile() -> dict | None:
+-    """The engine host's cached benchbw.json (this is where the serve reads it too), or None."""
 +def _read_bench_profile(path: str | None) -> dict | None:
 +    if path is None:
 +        return None
@@ -73,7 +73,7 @@
              if prof is None:
                  yield _bench_sse("error", {"message": "bench finished but no profile was written"})
              else:
-@@ -353,8 +382,24 @@
+@@ -353,7 +382,23 @@
  
      @app.get("/bench/profile", dependencies=auth)
      async def bench_profile():
@@ -93,9 +93,8 @@
 +                except Exception:  # noqa: BLE001 -- the arg below is the fallback
 +                    pass
 +            return _serve_gpu_uuid(manager.serve_args())
- 
-+        return await run(proxy_pool, read)
 +
-     return app
++        return await run(proxy_pool, read)
  
+     return app
  

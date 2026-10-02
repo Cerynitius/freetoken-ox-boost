@@ -7,10 +7,20 @@ to that formula (verified). Weight names match GlmDsaGatedMLP (gate/up/down_proj
 
 from __future__ import annotations
 
+import os
+
 import torch
 from freetoken.kernel.triton.dsv4.swiglu import fused_swiglu
 from freetoken.models.glm_moe_dsa.mlp import GlmDsaGatedMLP
 from freetoken.utils import nvtx_annotate
+
+
+# Opt-in (default OFF), read once at import: FREETOKEN_GLM5_MLP_FUSED=1 runs a decode token's
+# gate GEMV + up GEMV + both split-K reduces + clamped SwiGLU as ONE launch (fp8 W8A16
+# projections, M == 1); bit-identical -- see kernel/triton/fp8_gemv_fused.py.
+_MLP_FUSED = os.environ.get("FREETOKEN_GLM5_MLP_FUSED", "0") == "1"
+if _MLP_FUSED:
+    from freetoken.kernel.triton.fp8_gemv_fused import gate_up_swiglu_fused
 
 
 class Glm5ClampedMLP(GlmDsaGatedMLP):
@@ -21,6 +31,10 @@ class Glm5ClampedMLP(GlmDsaGatedMLP):
 
     @nvtx_annotate("MLP")
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if _MLP_FUSED:
+            h = gate_up_swiglu_fused(x, self.gate_proj, self.up_proj, self._limit)
+            if h is not None:
+                return self.down_proj.forward(h)
         gate = self.gate_proj.forward(x)
         up = self.up_proj.forward(x)
         return self.down_proj.forward(fused_swiglu(gate, up, self._limit, x.dtype))

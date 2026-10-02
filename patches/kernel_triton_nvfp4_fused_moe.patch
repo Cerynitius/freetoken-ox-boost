@@ -1,0 +1,106 @@
+--- a/python/freetoken/kernel/triton/nvfp4_fused_moe.py
++++ b/python/freetoken/kernel/triton/nvfp4_fused_moe.py
+@@ -140,6 +140,8 @@
+     topk_weights_ptr,  # [M, TOP_K] fp32
+     topk_ids_ptr,      # [M, TOP_K] int32 -> cache slot
+     lut_ptr,           # [16] fp32
++    route_mask_ptr,    # [M * TOP_K] int8, 1 = compute this route (HAS_MASK only)
++    act_up_off,        # FUSE_SILU: offset of the up half inside a gate_up row (== I)
+     total_routes,
+     N,
+     K,
+@@ -156,6 +158,8 @@
+     A_ROW_IS_ROUTE: tl.constexpr,
+     MUL_ROUTED_WEIGHT: tl.constexpr,
+     compute_type: tl.constexpr,
++    HAS_MASK: tl.constexpr = False,
++    FUSE_SILU: tl.constexpr = False,
+ ):
+     """Marlin-style NVFP4 decode GEMV: wide int32 weight loads + deferred reduction.
+ 
+@@ -174,6 +178,11 @@
+     decode GEMV (CUDA-graph safe: fixed shapes, no host sync)."""
+     route_id = tl.program_id(0)
+     n_block_id = tl.program_id(1)
++    if HAS_MASK:
++        # split decode (hit/miss phases): this launch owns only the masked-in routes;
++        # the other phase writes the rest of the (disjoint) route rows.
++        if tl.load(route_mask_ptr + route_id) == 0:
++            return
+     token_id = route_id // TOP_K
+     route_k = route_id - token_id * TOP_K
+ 
+@@ -211,7 +220,14 @@
+         for j in tl.static_range(8):
+             code = (word >> (4 * j)) & 0xF
+             b = tl.load(lut_ptr + code)
+-            a_j = tl.load(a_base + (kbase + j) * stride_ak, mask=w_mask, other=0.0).to(tl.float32)
++            if FUSE_SILU:
++                # a = bf16(silu(gate) * up) straight from the gate_up rows -- the same
++                # fp32 math + bf16 rounding the separate act_and_mul kernel stores.
++                g_j = tl.load(a_base + (kbase + j) * stride_ak, mask=w_mask, other=0.0).to(tl.float32)
++                u_j = tl.load(a_base + (act_up_off + kbase + j) * stride_ak, mask=w_mask, other=0.0).to(tl.float32)
++                a_j = (g_j / (1.0 + tl.exp(-g_j)) * u_j).to(compute_type).to(tl.float32)
++            else:
++                a_j = tl.load(a_base + (kbase + j) * stride_ak, mask=w_mask, other=0.0).to(tl.float32)
+             acc_w += a_j[:, None] * b
+         partial += acc_w * scale
+ 
+@@ -228,6 +244,27 @@
+ 
+ 
+ @triton.jit
++def _e2m1_to_f32(code):
++    """e2m1 nibble -> fp32 by building the IEEE bits (exact; replaces the 16-entry LUT
++    gather): |v| = 0, 0.5 (m=1), else 2^(e-1) * (1 + mant/2) with m = e<<1 | mant."""
++    m = code & 7
++    e = m >> 1
++    bits = tl.where(m >= 2, ((e + 126) << 23) | ((m & 1) << 22), tl.where(m == 1, 126 << 23, 0))
++    bits = bits | ((code & 8) << 28)
++    return bits.to(tl.float32, bitcast=True)
++
++
++@triton.jit
++def _e2m1_to_bf16(code):
++    """e2m1 nibble -> bf16 via its bit pattern (exact)."""
++    m = code & 7
++    e = m >> 1
++    bits = tl.where(m >= 2, ((e + 126) << 7) | ((m & 1) << 6), tl.where(m == 1, 126 << 7, 0))
++    bits = bits | ((code & 8) << 12)
++    return bits.to(tl.int16).to(tl.bfloat16, bitcast=True)
++
++
++@triton.jit
+ def _prefill_nvfp4_moe_kernel(
+     a_ptr,             # [M, K] activations
+     packed_ptr,        # [S, N, K // 2] uint8
+@@ -256,6 +293,8 @@
+     MUL_ROUTED_WEIGHT: tl.constexpr,
+     top_k: tl.constexpr,
+     compute_type: tl.constexpr,
++    ARITH_DECODE: tl.constexpr = False,
++    BF16_DECODE: tl.constexpr = False,
+ ):
+     pid = tl.program_id(axis=0)
+     num_pid_m = tl.cdiv(EM, BLOCK_SIZE_M)
+@@ -300,8 +339,18 @@
+             scale = tl.load(s_ptrs, mask=byte_mask[:, None], other=0.0).to(tl.float32)
+         else:
+             scale = e4m3_u8_to_f32(tl.load(s_ptrs, mask=byte_mask[:, None], other=0))
+-        b_lo = tl.load(lut_ptr + lo) * scale  # [BLOCK_KB, BLOCK_N]
+-        b_hi = tl.load(lut_ptr + hi) * scale
++        if BF16_DECODE:
++            # e2m1 * e4m3 has <= 6 significant bits: exact in bf16, so this equals the
++            # fp32 multiply + bf16 cast below bit for bit, at half the register width.
++            sb = scale.to(tl.bfloat16)
++            b_lo = _e2m1_to_bf16(lo) * sb
++            b_hi = _e2m1_to_bf16(hi) * sb
++        elif ARITH_DECODE:
++            b_lo = _e2m1_to_f32(lo) * scale  # [BLOCK_KB, BLOCK_N], no LUT gather
++            b_hi = _e2m1_to_f32(hi) * scale
++        else:
++            b_lo = tl.load(lut_ptr + lo) * scale  # [BLOCK_KB, BLOCK_N]
++            b_hi = tl.load(lut_ptr + hi) * scale
+ 
+         a_lo = tl.load(a_ptrs_lo, mask=token_mask[:, None] & byte_mask[None, :], other=0.0)
+         a_hi = tl.load(a_ptrs_hi, mask=token_mask[:, None] & byte_mask[None, :], other=0.0)

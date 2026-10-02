@@ -1,6 +1,40 @@
 --- a/python/freetoken/kvcache/__init__.py
 +++ b/python/freetoken/kvcache/__init__.py
-@@ -182,6 +182,9 @@
+@@ -40,6 +40,10 @@
+         from .mha_pool import MHAKVCache
+ 
+         return MHAKVCache
++    if getattr(model_config, "naive_args", None) is not None:
++        from .naive_pool import NaiveKVCache
++
++        return NaiveKVCache
+     types = {spec.attn_type for spec in specs_fn()}
+     if AttnType.DSV4 in types:
+         from .dsv4_paged_pool import DSV4PagedKVCache
+@@ -117,6 +121,22 @@
+     device: torch.device,
+     num_swa_tokens: int | None = None,
+ ) -> BaseKVCachePool:
++    if getattr(model_config, "naive_args", None) is not None:
++        from .naive_pool import NaiveKVCache
++
++        args = model_config.naive_args
++        return NaiveKVCache(
++            groups=model_config.kv_cache_group_specs(),
++            num_layers=model_config.num_layers,
++            num_full_pages=num_pages,
++            page_size=page_size,
++            num_swa_tokens=num_swa_tokens,
++            device=device,
++            dtype=dtype,
++            v_head_dim=args.v_head_dim,
++            index_dim=args.index_dim,
++        )
++
+     if model_config.has_swa_attention:
+         from .hybrid_swa_pool import HybridSWAKVCache
+ 
+@@ -182,6 +202,9 @@
              return DSAKVCache(
                  latent_dim=spec.head_dim,
                  num_layers=model_config.num_layers,
@@ -10,7 +44,7 @@
                  num_pages=num_pages,
                  page_size=page_size,
                  dtype=dtype,
-@@ -192,6 +195,7 @@
+@@ -192,6 +215,7 @@
          return MLAKVCache(
              latent_dim=spec.head_dim,
              num_layers=model_config.num_layers,

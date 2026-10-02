@@ -70,6 +70,14 @@ class _VLayerNorm(BaseOP):
                             self.bias.float()).to(x.dtype)
 
 
+# FREETOKEN_GLM5_VISION_ATTN_CHUNK=N (default 0 = off): run the per-image attention N query rows at a time, so a large
+# image's fp32 score matrix does not need ~7 GiB of free VRAM (it OOMed at memory_ratio >= 0.93, 2026-10-02).
+_ATTN_CHUNK = int(__import__("os").environ.get("FREETOKEN_GLM5_VISION_ATTN_CHUNK", "0") or 0)
+# With chunking on, the rows per chunk also shrink with the image so one chunk's fp32 scores [H, rows, L] stay within
+# FREETOKEN_GLM5_VISION_ATTN_BUDGET_MB (default 256): a 3840x2160 image (~42k patches) at 512 rows needed 1.4 GiB.
+_ATTN_BUDGET = int(__import__("os").environ.get("FREETOKEN_GLM5_VISION_ATTN_BUDGET_MB", "256") or 256) << 20
+
+
 class _VAttention(BaseOP):
     def __init__(self, vc):
         self.qkv = _VLinear(vc["hidden_size"], vc["hidden_size"] * 3, vc["attention_bias"])
@@ -92,7 +100,15 @@ class _VAttention(BaseOP):
             qi = q[a:b].transpose(0, 1)  # [H, L, D]
             ki = k[a:b].transpose(0, 1)
             vi = v[a:b].transpose(0, 1)
-            oi = F.scaled_dot_product_attention(qi, ki, vi, scale=self._scale)
+            rows = max(16, min(_ATTN_CHUNK, _ATTN_BUDGET // (4 * self._heads * (b - a)))) if _ATTN_CHUNK else 0
+            if rows and b - a > rows:
+                # Query-row chunks: each row's softmax(q k^T) v over ALL keys of the image is the
+                # same computation as the unchunked call; only the [H, L, L] score matrix (fp32:
+                # 16 x 10.5k^2 x 4 B = 6.9 GiB for a 1920x1080 image) is never materialized whole.
+                oi = torch.cat([F.scaled_dot_product_attention(qi[:, s:s + rows], ki, vi, scale=self._scale)
+                                for s in range(0, b - a, rows)], dim=1)
+            else:
+                oi = F.scaled_dot_product_attention(qi, ki, vi, scale=self._scale)
             outs.append(oi.transpose(0, 1))
         out = torch.cat(outs, dim=0).reshape(S, -1)
         return self.proj.forward(out)

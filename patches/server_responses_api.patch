@@ -1,0 +1,18 @@
+--- a/python/freetoken/server/responses_api.py
++++ b/python/freetoken/server/responses_api.py
+@@ -169,9 +169,13 @@
+         if request is not None:
+             events = state.stream_with_cancellation(events, request, uid)
+         return StreamingResponse(events, media_type="text/event-stream")
+-
++    _watch = state.watch_disconnect(request, uid) if hasattr(state, 'watch_disconnect') else None
+     try:
+-        result = await generate_full(uid, spec, state, source="/v1/responses")
++        try:
++            result = await generate_full(uid, spec, state, source="/v1/responses")
++        finally:
++            if _watch is not None:
++                _watch.cancel()
+     except GenerationError as exc:
+         return _error_response(400, str(exc), exc.code)
+     response = build_responses_response(result, req, response_id, created, cache_report=cache_report)

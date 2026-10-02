@@ -43,7 +43,7 @@
 +    if not v:
 +        return None
 +    return v in ("1", "true", "yes", "on")
- 
++
 +
 +def born_pinned_default() -> bool:
 +    """Whether PINNED serving banks use cudaHostAlloc instead of mmap + register-after-fill.
@@ -54,7 +54,7 @@
 +        return env
 +    return False
 +
-+
+ 
  class HostBank:
 -    """A lazily-allocated, page-aligned host buffer + its torch view, registered on demand.
 +    """A page-aligned host buffer + its torch view, page-locked on demand: allocate -> fill -> ``pin()``/``lock()``.
@@ -148,12 +148,7 @@
      def lock(self) -> None:
 -        """Make the buffer resident without a device mapping (VirtualLock/mlock).
 +        """mlock the (now-filled) buffer: resident without CUDA pin quota, but no device address -- only the CPU executor can serve a locked layer.
- 
--        Platform-specific and not implemented here. A locked bank layer is
--        CPU-executor-readable but must never be handed to the GPU movement
--        paths.
--        """
--        raise NotImplementedError("HostBank.lock() is platform-specific and not implemented")
++
 +        Lock after fill, or the lazy mmap faults+zero-fills every page. A failed lock (RLIMIT_MEMLOCK) warns once and leaves the bank PAGEABLE, which every consumer treats the same."""
 +        if self._locked or self._pinned:  # cudaHostRegister already page-locks
 +            return
@@ -171,7 +166,12 @@
 +
 +_os_locked_total = 0  # bytes locked so far; the OS lock ceiling is a per-process quota
 +_os_lock_failed = False  # sticky: once over quota, later (bigger-total) locks fail too
-+
+ 
+-        Platform-specific and not implemented here. A locked bank layer is
+-        CPU-executor-readable but must never be handed to the GPU movement
+-        paths.
+-        """
+-        raise NotImplementedError("HostBank.lock() is platform-specific and not implemented")
 +
 +def _os_lock(addr: int, nbytes: int) -> None:
 +    global _os_locked_total

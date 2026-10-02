@@ -1,9 +1,25 @@
 --- a/python/freetoken/moe/offload_kernels.py
 +++ b/python/freetoken/moe/offload_kernels.py
-@@ -25,6 +25,26 @@
+@@ -25,6 +25,42 @@
      tensor. ``out_indices`` aliases the input, preserving the in-place rewrite every
      downstream GEMM depends on.
      """
++    if cache.cache_policy == "soft":
++        # Score-aware LRFU (Naive): the router stashed this call's ranked ids/scores on
++        # the cache (consumed once); other callers fall back to unit-weight touches.
++        from freetoken.moe.soft_ensure import soft_ensure
++
++        rank = getattr(cache, "_soft_rank", None)
++        masks = getattr(cache, "_soft_masks", None)
++        cache._soft_rank = None
++        cache._soft_masks = None
++        soft_ensure(
++            cache, layer_id, expert_ids,
++            *(rank if rank is not None else (None, None)),
++            stats=cache.lru_stats[layer_id] if cache.collect_stats else None,
++            masks=masks,
++        )
++        return
 +    if cache.cache_policy == "lfu":
 +        # Frequency-aware admission for flat routing (GLM-5.3): one-touch experts are
 +        # evicted before repeat visitors. See freetoken/moe/lfu_ensure.py.

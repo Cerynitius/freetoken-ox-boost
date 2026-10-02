@@ -13,16 +13,19 @@
      image_token_id: int | None = None
      attention_groups: Tuple[AttentionGroupConfig, ...] = ()
      has_attn_bias: bool = False
-@@ -288,6 +294,8 @@
+@@ -288,6 +294,11 @@
      # swigluoai/dense-MLP scalars the model module needs. Opaque to model-agnostic engine
      # code; None for every other model.
      m3_args: Any | None = None
 +    # GLM-5.3-Flash (glm5_next) payload (Glm5NextArgs): hc / KDA / MLA-DSA / MoE / split.
 +    glm5_args: Any | None = None
++    # Naive-N0.5-Flash (naive_n05_flash) payload (NaiveArgs): per-layer SWA/DSA split, GQA
++    # geometry (K 192 / V 128), sinks, value scale, indexer geometry. Opaque to engine code.
++    naive_args: Any | None = None
      # Generic execution-path capability flags (set by a model's parse_config) so the engine and
      # factories stay model-agnostic instead of branching on dsv4_args:
      single_stream_only: bool = False  # model runs one sequence at a time -> force bs=1
-@@ -298,12 +306,22 @@
+@@ -298,12 +309,22 @@
  
      @property
      def num_moe_layers(self) -> int:
@@ -38,12 +41,12 @@
          """
 -        return self.num_layers - self.first_k_dense_replace
 +        n = self.num_layers - self.first_k_dense_replace
-+        g5 = getattr(self, "glm5_args", None)
-+        if g5 is not None:
-+            n -= sum(
-+                1 for l in g5.resident_layer_ids
-+                if self.first_k_dense_replace <= l < self.num_layers
-+            )
++        for args in (getattr(self, "glm5_args", None), getattr(self, "naive_args", None)):
++            if args is not None:
++                n -= sum(
++                    1 for l in args.resident_layer_ids
++                    if self.first_k_dense_replace <= l < self.num_layers
++                )
 +        return n
  
      @property

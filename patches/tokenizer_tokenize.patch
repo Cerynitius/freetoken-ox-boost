@@ -1,11 +1,9 @@
 --- a/python/freetoken/tokenizer/tokenize.py
 +++ b/python/freetoken/tokenizer/tokenize.py
-@@ -21,6 +21,51 @@
- )
- 
+@@ -23,6 +23,51 @@
  logger = init_logger(__name__)
-+
-+
+ 
+ 
 +def _expand_image_tokens(prompt: str, images: list) -> str:
 +    """Expand multimodal placeholders in template order, mirroring
 +    Glm5NextProcessor: the k-th ``<|image|>`` becomes grid.prod/merge^2 image
@@ -49,9 +47,11 @@
 +        else:
 +            out.append(p)
 +    return "".join(out)
- 
- 
++
++
  def resolve_thinking_mode(chat_template_kwargs: dict[str, Any] | None, tools: Any | None) -> str:
+     """Resolve the thinking mode (``"thinking"`` or ``"chat"``) for a chat request.
+ 
 @@ -60,6 +105,9 @@
          # TODO: batch tokenization
          for msg in msgs:

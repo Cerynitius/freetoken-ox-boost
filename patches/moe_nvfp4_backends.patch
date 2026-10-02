@@ -1,0 +1,10 @@
+--- a/python/freetoken/moe/nvfp4_backends.py
++++ b/python/freetoken/moe/nvfp4_backends.py
+@@ -775,6 +775,7 @@
+         activation="silu",
+         source_format="modelopt",
+         _prepared_weights=prepared,
++        fast_math=os.environ.get("FREETOKEN_B12X_FAST_MATH", "1") != "0",
+     )
+     return out
+ 

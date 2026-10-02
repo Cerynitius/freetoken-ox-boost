@@ -1,6 +1,32 @@
 --- a/python/freetoken/kernel/triton/fp8_pertensor_linear.py
 +++ b/python/freetoken/kernel/triton/fp8_pertensor_linear.py
-@@ -121,6 +121,100 @@
+@@ -41,6 +41,14 @@
+ # (numeric reference / A-B debugging). Evaluated once; the kernels are the default.
+ _USE_REF = os.environ.get("FREETOKEN_DEBUG_FP8_REF") == "1"
+ 
++# Opt-in (default OFF): FREETOKEN_FP8_GEMV_FUSED_REDUCE=1 folds the split-K reduce launch
++# into the GEMV itself (last-arriving CTA reduces in the same fixed order) for the
++# M <= 4 decode paths -- bit-identical, see fp8_gemv_fused.py. Read once at import.
++_FUSED_REDUCE = os.environ.get("FREETOKEN_FP8_GEMV_FUSED_REDUCE", "0") == "1"
++if _FUSED_REDUCE:
++    from freetoken.kernel.triton.fp8_gemv_fused import gemv_fused as _gemv_fused
++    from freetoken.kernel.triton.fp8_gemv_fused import gemv_m_fused as _gemv_m_fused
++
+ 
+ # ======================================================================================
+ # Decode (M==1) split-K GEMV: raw fp8 x bf16 reduction in fp32, per-row scale at reduce.
+@@ -97,6 +105,10 @@
+ def _gemv(a: torch.Tensor, weight: torch.Tensor, weight_scale: torch.Tensor,
+           out_dtype: torch.dtype) -> torch.Tensor:
+     """M==1 split-K GEMV. ``a`` [K] bf16; ``weight`` [N, K] fp8; ``weight_scale`` [N] fp32."""
++    if _FUSED_REDUCE:
++        out = _gemv_fused(a, weight, weight_scale, out_dtype)
++        if out is not None:
++            return out
+     N, K = weight.shape
+     BLOCK_K = 128
+     n_kb = triton.cdiv(K, BLOCK_K)
+@@ -121,6 +133,104 @@
  
  
  # ======================================================================================
@@ -71,6 +97,10 @@
 +def _gemv_m(a: torch.Tensor, weight: torch.Tensor, weight_scale: torch.Tensor,
 +            out_dtype: torch.dtype) -> torch.Tensor:
 +    """2 <= M <= 8 split-K GEMV. ``a`` [M, K] bf16; ``weight`` [N, K] fp8."""
++    if _FUSED_REDUCE:
++        out = _gemv_m_fused(a, weight, weight_scale, out_dtype)
++        if out is not None:
++            return out
 +    M, K = a.shape
 +    N = weight.shape[0]
 +    BLOCK_K = 128
@@ -101,7 +131,7 @@
  # Prefill (M>1) W8A16 GEMM: fp8 weight read from HBM, upcast to bf16 in-register for the
  # tensor-core dot (fp8 e4m3 -> bf16 is lossless), per-row scale applied after accumulation.
  # ======================================================================================
-@@ -275,6 +369,11 @@
+@@ -275,6 +385,11 @@
          ).reshape(*lead, N)
      elif x.numel() // K == 1:
          out = _gemv(x.reshape(K), e4m3_kernel_view(weight), weight_scale, x.dtype).reshape(*lead, N)

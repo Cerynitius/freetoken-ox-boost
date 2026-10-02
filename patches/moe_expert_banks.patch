@@ -1,6 +1,6 @@
 --- a/python/freetoken/moe/expert_banks.py
 +++ b/python/freetoken/moe/expert_banks.py
-@@ -24,11 +24,14 @@
+@@ -24,10 +24,13 @@
  
  from freetoken.utils import init_logger
  
@@ -11,11 +11,10 @@
  
 +# the parallel expert-bank reader needs POSIX O_DIRECT + preadv; without them the serial (safetensors/mmap) build is the only option
 +_PARALLEL_READER_SUPPORTED = hasattr(os, "O_DIRECT") and hasattr(os, "preadv")
- 
 +
+ 
  @dataclass(frozen=True)
  class ExpertBanks:
-     """Loaded expert banks, normalized for ``OffloadMoeCache`` wiring."""
 @@ -40,8 +43,7 @@
      # marlin/b12x per-expert global scales ([L*E]); None for formats without them
      gate_up_alpha: torch.Tensor | None = field(default=None)
@@ -43,12 +42,10 @@
          native = backend == "triton"
  
      repack_sink = None
-@@ -369,8 +377,40 @@
-     if not sizes:
-         return True
+@@ -371,6 +379,38 @@
      return avail > sum(sizes) + max(sizes)
-+
-+
+ 
+ 
 +def ftw_bank_bytes(model_path: str) -> int | None:
 +    """Total expert-bank bytes of an FTW checkpoint, from its metadata (no bank IO).
 +    ``None`` when the checkpoint is not FTW -- callers that size things pre-load (auto split residency) then leave the load unchanged."""
@@ -60,8 +57,8 @@
 +    with open(meta, encoding="utf-8") as f:
 +        tensors = json.load(f).get("tensors", [])
 +    return sum(t["nbytes"] for t in tensors if t.get("kind") == "experts_bank")
- 
- 
++
++
 +def bank_bytes_estimate(model_config) -> int | None:
 +    """Estimated total expert-bank bytes of a raw checkpoint, from the model config alone.
 +
