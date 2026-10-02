@@ -28,7 +28,7 @@ offload), single-stream decode unless noted.
 | mHC pre-norm fusion (cast/mean/rsqrt in one kernel + atomics-free gemv) | within noise (-6 kernels/layer) | `overlay: kernel/triton/dsv4/hc_norm.py` + `models/glm5_next/model.py` | none (epsilon-level numerics) |
 | Router fusion (sigmoid+bias+topk+renorm, 8 kernels -> 1) | +3.4% | `overlay: kernel/triton/fused_route.py` + `patches: models_glm_moe_dsa_moe` | `FREETOKEN_FUSED_ROUTE` (1; auto-falls back when n_group>1) |
 | FP8 small-batch M-tile GEMV (2<=M<=4 skips the prefill GEMM) | conc2 +13% (M=2 kernel 3x) | `patches: kernel_triton_fp8_pertensor_linear` | none (automatic for M<=4) |
-| 2-slot 256K KV pool (cache 2079 -> 2600 slots) | single +14%, conc4 +67% | `examples/serve_full.sh` | `GLM5_KV_RESERVE` (524288) |
+| 2-slot 256K KV pool (cache 2079 -> 2600 slots) | single +14%, conc4 +67% (2026-08; superseded by elastic KV, see October section) | `examples/serve_full.sh` | `GLM5_KV_RESERVE` |
 | CPU swiglu_clamp support (hybrid backend can serve GLM-5.3) | net-zero on this VM; kernels kept | `patches: kernel_csrc...cpu_moe_ext / moe_cpu_executor / layers_moe (bs gate)` | `GLM5_MOE_BACKEND=hybrid` + `GLM5_CPU_THREADS` |
 
 ## Vision support (env-gated, default off)
@@ -73,16 +73,54 @@ Validation: tower parity vs HF stage-by-stage on real weights (patch embed +
 rotary tables bitwise-equal; per-layer drift within the BF16 kernel-noise
 envelope of HF sdpa-vs-eager). End-to-end on the production server: shapes /
 colors / positions, counting, two-image comparison, text-in-image reading, on
-both APIs. Constraints: an image prompt must fit one prefill chunk;
-`count_tokens` does not account for image expansion yet; Anthropic-endpoint
-video blocks are not supported (no standard block type).
+both APIs. Constraints: `count_tokens` does not account for image expansion
+yet; Anthropic-endpoint video blocks are not supported (no standard block
+type). Since 2026-10-02 an image prompt no longer has to fit one prefill chunk
+(see the October section).
+
+## October 2026: decode, prefill and multimodal (GLM-5.3-Flash)
+
+All lossless: each switch was checked by greedy decoding of three ~0.9K-token
+prompts x 1024 tokens against the configuration before it (token-for-token
+identical), plus prefix-cache repeats and images where relevant. Speeds are
+single-stream / 2-concurrent aggregate tok/s on the same prompts. All are on in
+`examples/serve_full.sh`.
+
+| Step | Single / conc2 | Files | Switch |
+|---|---|---|---|
+| Starting point (2026-10-01: ratio 0.88, elastic KV 1M, 8 resident layers) | 29.2 / 33.1 | -- | -- |
+| Prefill hit-D2D restored: the batch_memcpy probe raced the zero-fill on another stream, so hit-D2D silently fell back to whole-layer copies on most boots | decode unchanged; warm ~0.9K prefill 3.15 -> 2.51 s, conc TTFT 6.1 -> 4.8 s | `patches: kernel_batch_memcpy` | `FREETOKEN_BATCH_MEMCPY=0` forces the fallback |
+| Memory ratio 0.88 -> 0.93 (+357 expert slots) | 31.7 / 36.9 | `examples/serve_full.sh` | `--memory-ratio` |
+| Hit/miss split decode | 32.3 / 38.3 (with 0.93) | `patches: layers_moe` | `FREETOKEN_MOE_SPLIT_OVERLAP` |
+| Soft expert cache fed by the GLM router's ranked near-misses, fp32 gate cached at load; includes a guarded prefetch (the old LRU prefetch stamp made soft evict slots whose copy was still in flight) | 34.8 / 40.5; misses/token 38.1 -> 33.7 | `overlay: moe/soft_ensure.py`, `moe/spec_prefetch.py`; `patches: models_glm_moe_dsa_moe` | `FREETOKEN_MOE_CACHE_POLICY=soft` + `FREETOKEN_GLM5_SOFT_RANK` + `FREETOKEN_GLM5_GATE_FP32_CACHE` |
+| Memory ratio 0.96 with `--max-extend-length 4096` (half the prefill activation peak; 0.95 at 8192 OOMed on a 15K prompt) | 36.6 / 43.3 | `examples/serve_full.sh` | `--memory-ratio`, `--max-extend-length` |
+| Shared expert runs while the miss copy is in flight | 37.2 / 43.1 | `patches: layers_moe / models_glm_moe_dsa_moe` | `FREETOKEN_GLM5_SHARED_OVERLAP` |
+| FP8 GEMV split-K reduce folded into the GEMV; shared/dense MLP in one launch; DSA pool/top-k glue 54 -> 3 kernels per MLA layer | 37.7 / 42.9 (all three; DSA glue alone 37.4 / 44.1) | `overlay: kernel/triton/fp8_gemv_fused.py, kernel/triton/glm_dsa_glue.py`; `patches: kernel_triton_fp8_pertensor_linear / attention_dsa`; `overlay: models/glm5_next/mlp.py` | `FREETOKEN_FP8_GEMV_FUSED_REDUCE`, `FREETOKEN_GLM5_MLP_FUSED`, `FREETOKEN_GLM5_DSA_GLUE` |
+| mHC Sinkhorn + pre_combine in one launch (mode 1); swiglu_clamp folded into the Marlin down GEMV | within noise | `overlay: kernel/triton/dsv4/hc_split_combine.py, kernel/triton/nvfp4_marlin_swiglu.py` | `FREETOKEN_GLM5_HC_FUSED=1`, `FREETOKEN_NVFP4_SWIGLU_FUSED` |
+| Final (`examples/serve_full.sh`) | ~38 / ~45; 36.8 at 128K context | -- | -- |
+
+Measured and not adopted: KDA in-place state update (`FREETOKEN_GLM5_KDA_INPLACE`,
+bit-identical, no gain); spec prefetch P=2/6/8 (P=0 -3%, P=6/8 slower: fewer
+misses but wasted bandwidth); soft decay/clock knobs
+(`FREETOKEN_SOFT_DECAY_LAMQ/TICKS`, `FREETOKEN_SOFT_WSEL/WSCORE`) and ranked lists
+at bs 2-4 (`FREETOKEN_GLM5_SOFT_RANK_BS2`), no gain; max-running 4 (30.4
+aggregate, below conc2); `FREETOKEN_GLM5_HC_FUSED=2` (changes summation order).
+Releasing all 8 resident layers into the cache (VRAM-neutral) gave +8% / +6% but
+pins 30 GB more host RAM, which swapped on a 186 GB host.
+
+Multimodal robustness (2026-10-02):
+
+| Fix | Files | Switch |
+|---|---|---|
+| Multimodal prompt longer than one prefill chunk raised in the scheduler and killed the backend (3840x2160 image; or two concurrent 1920x1080 images at chunk 4096). Now: wait for a full budget, refuse with `multimodal_prompt_too_long`, or prefill across chunks with per-chunk embedding rows. Also fixes the admission-undo path on caches without ping-pong slots | `patches: scheduler_prefill / scheduler_scheduler / scheduler_utils` | `FREETOKEN_MM_CHUNKED_PREFILL` (0; examples 1) |
+| Vision attention in query-row chunks sized to a memory budget (the fp32 score matrix of a 1920x1080 image needed 6.9 GB) | `overlay: models/glm5_next/vision.py` | `FREETOKEN_GLM5_VISION_ATTN_CHUNK` (0; examples 512) + `FREETOKEN_GLM5_VISION_ATTN_BUDGET_MB` (256) |
 
 ## Archived experiments (off by default; verdicts in commit history)
 
 | Experiment | Verdict | Switch |
 |---|---|---|
 | MTP speculative decoding (full verify engine + CUDA graph) | correct but -13% under PCIe-byte billing; archived | `FREETOKEN_GLM5_SPEC` (0) |
-| LFU-decay cache policy | loses on real load (drift-shaped locality) | `FREETOKEN_MOE_CACHE_POLICY` (lru) |
+| LFU-decay cache policy | loses on real load (drift-shaped locality); the score-aware `soft` policy replaced it in 2026-10 | `FREETOKEN_MOE_CACHE_POLICY` (lru; examples use soft) |
 | Fallback-free miss cap (expert dropping) | first round -35% (order-blind drop); pending round 2 | `FREETOKEN_MOE_MISS_CAP` (-1) |
 | top-k knob | top-6 gives +6% but changes the A18B spec; vetoed | `FREETOKEN_GLM5_TOPK` (unset = 8) |
 | Routing trace collection | analysis tool | `FREETOKEN_ROUTE_TRACE` (off; value is the dump path) |
